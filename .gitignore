@@ -1,0 +1,12 @@
+build/
+.ci-deps/
+*.log
+*.elf
+*.bin
+*.map
+*.a
+*.o
+*.obj
+*.pyc
+__pycache__/
+*.local.h

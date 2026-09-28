@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Configure tests
+        run: cmake -S tests -B build/tests -G Ninja
+      - name: Build tests
+        run: cmake --build build/tests
+      - name: Run tests
+        run: ctest --test-dir build/tests --output-on-failure
