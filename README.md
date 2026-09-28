@@ -25,7 +25,7 @@ target_link_libraries(my_app PRIVATE stm_esp_hosted_lwip) # 或仅 stm_esp_hoste
 
 ## 板级参考与验证
 
-STM32H723 示例见 本地 `stm_h723_demo` 工程的 `main/app_main.c`。ESP32-C3 的参考固件工程位于本仓库 `firmware/esp32c3_cp/`。该板连接 SPI1 MOSI=PD7、MISO=PA6、SCLK=PG11、CS=PC4、Handshake=PA2、Data Ready=PA3、Reset/EN=PC5；ESP32-C3 对应 GPIO7/2/6/10/3/4。其他板请核对原理图并更换配置。
+STM32H723 板级示例位于配套 `stm_h723_demo` 工程的 `main/app_main.c`。ESP32-C3 的参考固件工程位于本仓库 `firmware/esp32c3_cp/`。该板连接 SPI1 MOSI=PD7、MISO=PA6、SCLK=PG11、CS=PC4、Handshake=PA2、Data Ready=PA3、Reset/EN=PC5；ESP32-C3 对应 GPIO7/2/6/10/3/4。其他板请核对原理图并更换配置。
 
 ```sh
 cmake -S tests -B build/stm_esp_hosted_tests -G Ninja

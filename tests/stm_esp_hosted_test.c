@@ -419,4 +419,3 @@ int main(void)
     puts("stm_esp_hosted tests: PASS");
     return 0;
 }
-

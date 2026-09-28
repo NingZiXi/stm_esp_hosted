@@ -24,4 +24,3 @@ void netif_set_link_up(struct netif *n);
 void netif_set_link_down(struct netif *n);
 int netif_is_link_up(const struct netif *n);
 #endif
-
