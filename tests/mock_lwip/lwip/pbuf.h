@@ -2,6 +2,8 @@
 #define MOCK_LWIP_PBUF_H
 #include <stdint.h>
 #include "lwip/netif.h"
+#define PBUF_TRANSPORT 2
+#define PBUF_RAM 3
 #define PBUF_RAW 0
 #define PBUF_POOL 1
 struct pbuf { struct pbuf *next; void *payload; uint16_t len, tot_len; };

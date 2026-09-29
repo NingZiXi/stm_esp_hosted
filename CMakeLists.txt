@@ -28,7 +28,7 @@ target_link_libraries(stm_esp_hosted PUBLIC stm_common)
 
 # The lwIP Ethernet netif remains optional for applications using only SPI/RPC.
 if(TARGET lwip)
-    add_library(stm_esp_hosted_lwip STATIC stm_esp_hosted_lwip.c)
+    add_library(stm_esp_hosted_lwip STATIC stm_esp_hosted_lwip.c stm_esp_hosted_dhcps.c)
     target_compile_features(stm_esp_hosted_lwip PUBLIC c_std_11)
     target_include_directories(stm_esp_hosted_lwip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(stm_esp_hosted_lwip PUBLIC stm_esp_hosted lwip)

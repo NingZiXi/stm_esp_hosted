@@ -26,6 +26,7 @@ extern "C" {
 #define ESP_HOSTED_DMA_ALIGNMENT     32U
 #define ESP_HOSTED_DUMMY_IF_TYPE     8U
 #define ESP_HOSTED_STA_IF_TYPE       1U
+#define ESP_HOSTED_AP_IF_TYPE        2U
 #define ESP_HOSTED_PRIV_IF_TYPE      5U
 #define ESP_HOSTED_STA_MTU           1500U
 #define ESP_HOSTED_LEGACY_DUMMY_IF_TYPE 6U
@@ -222,15 +223,100 @@ stm_err_t esp_hosted_set_callbacks(esp_hosted_handle_t handle,
                                    esp_hosted_rx_fn receive,
                                    esp_hosted_link_fn link,
                                    void *user);
-/** @brief 获取 STA MAC（先完成 esp_hosted_start）。 */
-stm_err_t esp_hosted_get_sta_mac(esp_hosted_handle_t handle, uint8_t mac[6]);
+/** @brief 查询协处理器版本（先完成 esp_hosted_start）。 */
 stm_err_t esp_hosted_get_version(esp_hosted_handle_t handle, esp_hosted_version_t *version);
-/** @brief 初始化 Wi-Fi STA、配置凭据并等待连接事件；不会记录凭据。 */
-stm_err_t esp_hosted_connect(esp_hosted_handle_t handle,
-                             const char *ssid, const char *password,
-                             uint32_t timeout_ms);
-stm_err_t esp_hosted_disconnect(esp_hosted_handle_t handle);
-uint8_t esp_hosted_is_connected(esp_hosted_handle_t handle);
+
+typedef enum {
+    EH_WIFI_MODE_NULL = 0,
+    EH_WIFI_MODE_STA = 1,
+    EH_WIFI_MODE_AP = 2,
+    EH_WIFI_MODE_APSTA = 3,
+} eh_wifi_mode_t;
+typedef enum { EH_WIFI_IF_STA = 0, EH_WIFI_IF_AP = 1 } eh_wifi_if_t;
+typedef struct {
+    char ssid[33];
+    char password[65];
+} eh_wifi_sta_config_t;
+typedef struct {
+    char ssid[33];
+    char password[65];
+    uint8_t channel;
+    uint8_t hidden;
+    uint8_t max_connections;
+} eh_wifi_ap_config_t;
+typedef union {
+    eh_wifi_sta_config_t sta;
+    eh_wifi_ap_config_t ap;
+} eh_wifi_config_t;
+typedef struct {
+    const char *ssid; /* NULL scans all SSIDs. */
+    uint8_t channel;  /* 0 scans all channels. */
+    uint8_t show_hidden;
+} eh_wifi_scan_config_t;
+typedef struct {
+    uint8_t bssid[6];
+    char ssid[33];
+    uint8_t channel;
+    int8_t rssi;
+    uint8_t authmode;
+} eh_wifi_ap_record_t;
+/** Snapshot maintained by RPC replies and asynchronous Wi-Fi events; no RPC is sent. */
+typedef struct {
+    eh_wifi_mode_t mode;
+    uint8_t started;
+    uint8_t sta_connected;
+    uint8_t ap_started;
+    uint8_t scan_pending;
+    uint32_t last_disconnect_reason;
+} eh_wifi_status_t;
+typedef enum {
+    EH_WIFI_EVENT_SCAN_DONE,
+    EH_WIFI_EVENT_STA_CONNECTED,
+    EH_WIFI_EVENT_STA_DISCONNECTED,
+    EH_WIFI_EVENT_AP_STARTED,
+    EH_WIFI_EVENT_AP_STOPPED,
+    EH_WIFI_EVENT_AP_CLIENT_CONNECTED,
+    EH_WIFI_EVENT_AP_CLIENT_DISCONNECTED,
+} eh_wifi_event_id_t;
+typedef struct {
+    eh_wifi_event_id_t id;
+    uint32_t reason;
+    uint32_t scan_count;
+    uint32_t scan_status; /* CP status: zero means success. */
+    uint8_t client_mac[6];
+    uint16_t aid;
+} eh_wifi_event_t;
+typedef void (*eh_wifi_event_fn)(void *user, const eh_wifi_event_t *event);
+typedef void (*eh_wifi_ap_rx_fn)(void *user, const uint8_t *frame, size_t length);
+typedef void (*eh_wifi_ap_link_fn)(void *user, uint8_t up);
+
+/* Wi-Fi operations require esp_hosted_start() first. connect/scan_start initiate
+ * asynchronous operations; call esp_hosted_poll() frequently to receive events. */
+stm_err_t eh_wifi_init(esp_hosted_handle_t handle, uint32_t timeout_ms);
+stm_err_t eh_wifi_set_mode(esp_hosted_handle_t handle, eh_wifi_mode_t mode, uint32_t timeout_ms);
+stm_err_t eh_wifi_set_config(esp_hosted_handle_t handle, eh_wifi_if_t iface,
+                             const eh_wifi_config_t *config, uint32_t timeout_ms);
+stm_err_t eh_wifi_start(esp_hosted_handle_t handle, uint32_t timeout_ms);
+stm_err_t eh_wifi_stop(esp_hosted_handle_t handle, uint32_t timeout_ms);
+stm_err_t eh_wifi_connect(esp_hosted_handle_t handle, uint32_t timeout_ms);
+stm_err_t eh_wifi_disconnect(esp_hosted_handle_t handle, uint32_t timeout_ms);
+uint8_t eh_wifi_is_connected(esp_hosted_handle_t handle);
+/** Read cached state without sending an RPC. */
+stm_err_t eh_wifi_get_status(esp_hosted_handle_t handle, eh_wifi_status_t *status);
+/** Query the currently associated AP; requires a STA connection. */
+stm_err_t eh_wifi_sta_get_ap_info(esp_hosted_handle_t handle, eh_wifi_ap_record_t *record,
+                                  uint32_t timeout_ms);
+stm_err_t eh_wifi_scan_start(esp_hosted_handle_t handle,
+                             const eh_wifi_scan_config_t *config, uint32_t timeout_ms);
+stm_err_t eh_wifi_scan_stop(esp_hosted_handle_t handle, uint32_t timeout_ms);
+stm_err_t eh_wifi_scan_get_results(esp_hosted_handle_t handle, eh_wifi_ap_record_t *records,
+                                   size_t capacity, size_t *count, uint32_t timeout_ms);
+stm_err_t eh_wifi_set_event_callback(esp_hosted_handle_t handle, eh_wifi_event_fn callback, void *user);
+stm_err_t eh_wifi_set_ap_rx_callback(esp_hosted_handle_t handle, eh_wifi_ap_rx_fn callback, void *user);
+stm_err_t eh_wifi_set_ap_link_callback(esp_hosted_handle_t handle, eh_wifi_ap_link_fn callback, void *user);
+stm_err_t eh_wifi_get_mac(esp_hosted_handle_t handle, eh_wifi_if_t iface, uint8_t mac[6]);
+stm_err_t eh_wifi_ap_send(esp_hosted_handle_t handle, const uint8_t *frame, size_t length);
+
 /** @brief 发送完整 Ethernet 帧；长度不得超过 ESP_HOSTED_STA_MTU + 14。 */
 stm_err_t esp_hosted_send(esp_hosted_handle_t handle,
                           const uint8_t *frame, size_t length);

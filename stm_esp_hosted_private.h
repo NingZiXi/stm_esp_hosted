@@ -11,7 +11,7 @@ struct esp_hosted_context {
     uint32_t uid;
     uint32_t response_uid;
     uint16_t response_id;
-    uint8_t response_data[128];
+    uint8_t response_data[512];
     size_t response_length;
     esp_hosted_version_t version;
     uint8_t mac[6];
@@ -19,6 +19,18 @@ struct esp_hosted_context {
     uint8_t negotiated;
     uint8_t connected;
     uint8_t wifi_initialized;
+    uint8_t wifi_started;
+    uint8_t wifi_mode;
+    uint8_t scan_pending;
+    uint8_t scan_done;
+    uint32_t last_disconnect_reason;
+    eh_wifi_event_fn wifi_event;
+    void *wifi_event_user;
+    eh_wifi_ap_link_fn ap_link;
+    void *ap_link_user;
+    uint8_t ap_up;
+    eh_wifi_ap_rx_fn ap_receive;
+    void *ap_user;
     uint8_t response_ready;
 };
 #endif

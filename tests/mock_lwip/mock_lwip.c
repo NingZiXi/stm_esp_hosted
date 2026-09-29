@@ -42,3 +42,20 @@ void netif_set_link_down(struct netif *n) { n->link_up = 0; }
 int netif_is_link_up(const struct netif *n) { return n->link_up; }
 err_t etharp_output(struct netif *n, struct pbuf *p, const void *addr)
 { (void)addr; return n->linkoutput(n, p); }
+
+unsigned mock_dhcp_starts, mock_dhcp_stops;
+int mock_dhcp_error;
+err_t dhcp_start(struct netif *n)
+{
+    (void)n; ++mock_dhcp_starts;
+    return mock_dhcp_error ? ERR_IF : ERR_OK;
+}
+void dhcp_stop(struct netif *n) { (void)n; ++mock_dhcp_stops; }
+uint8_t dhcp_supplied_address(const struct netif *n) { return n->ip_addr.byte[0] != 0U; }
+void netif_set_addr(struct netif *n, const ip4_addr_t *ip,
+                    const ip4_addr_t *mask, const ip4_addr_t *gw)
+{
+    n->ip_addr = ip ? *ip : (ip4_addr_t){{0}};
+    n->netmask = mask ? *mask : (ip4_addr_t){{0}};
+    n->gw = gw ? *gw : (ip4_addr_t){{0}};
+}

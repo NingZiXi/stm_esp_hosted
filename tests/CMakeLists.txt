@@ -44,3 +44,11 @@ target_compile_definitions(stm_esp_hosted_lwip_tests PRIVATE STM_ESP_HOSTED_HAL_
 target_include_directories(stm_esp_hosted_lwip_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/mock_lwip ${CMAKE_CURRENT_SOURCE_DIR} .. ${STM_ESP_HOSTED_TEST_COMMON})
 add_test(NAME stm_esp_hosted_lwip_tests COMMAND stm_esp_hosted_lwip_tests)
+
+add_executable(stm_esp_hosted_dhcps_tests
+    ../stm_esp_hosted_dhcps.c mock_lwip/mock_lwip.c dhcps_test.c)
+target_compile_features(stm_esp_hosted_dhcps_tests PRIVATE c_std_11)
+target_compile_definitions(stm_esp_hosted_dhcps_tests PRIVATE STM_ESP_HOSTED_HAL_HEADER="hal_stub.h")
+target_include_directories(stm_esp_hosted_dhcps_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/mock_lwip ${CMAKE_CURRENT_SOURCE_DIR} .. ${STM_ESP_HOSTED_TEST_COMMON})
+add_test(NAME stm_esp_hosted_dhcps_tests COMMAND stm_esp_hosted_dhcps_tests)

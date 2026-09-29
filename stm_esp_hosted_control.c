@@ -9,6 +9,10 @@
 #define PRIV_IF 5U
 #define WIFI_CONNECTED_EVENT 775U
 #define WIFI_DISCONNECTED_EVENT 776U
+#define WIFI_SCAN_DONE_EVENT 774U
+#define WIFI_AP_CLIENT_CONNECTED_EVENT 771U
+#define WIFI_AP_CLIENT_DISCONNECTED_EVENT 772U
+#define WIFI_NO_ARGS_EVENT 773U
 
 /* Internal layout is shared with the transport implementation within this component. */
 #include "stm_esp_hosted_private.h"
@@ -51,7 +55,8 @@ static int field(const uint8_t *data, size_t len, uint32_t wanted, uint8_t wire,
     int found = 0;
     while (p < end) {
         uint64_t key, n;
-        if (!read_varint(&p, end, &key) || !(key >> 3U) || !read_varint(&p, end, &n)) { return -1; }
+        if (!read_varint(&p, end, &key) || !(key >> 3U) ||
+            !read_varint(&p, end, &n)) { return -1; }
         if ((key & 7U) == 0U) {
             if ((key >> 3U) == wanted && wire == 0U) { *number = n; found = 1; }
         } else if ((key & 7U) == 2U) {
@@ -72,6 +77,17 @@ static void link_change(struct esp_hosted_context *ctx, uint8_t connected)
         if (ctx->link) { ctx->link(ctx->user, connected); }
     }
 }
+static void ap_link_change(struct esp_hosted_context *ctx, uint8_t up)
+{
+    if (ctx->ap_up != up) {
+        ctx->ap_up = up;
+        if (ctx->ap_link) { ctx->ap_link(ctx->ap_link_user, up); }
+    }
+}
+static void emit_wifi_event(struct esp_hosted_context *ctx, const eh_wifi_event_t *event)
+{
+    if (ctx->wifi_event) { ctx->wifi_event(ctx->wifi_event_user, event); }
+}
 static stm_err_t consume(struct esp_hosted_context *ctx)
 {
     esp_hosted_frame_t frame = {0};
@@ -85,6 +101,11 @@ static stm_err_t consume(struct esp_hosted_context *ctx)
     if (frame.if_type == ESP_HOSTED_STA_IF_TYPE) {
         if (frame.payload_length >= 14U && frame.payload_length <= ESP_HOSTED_STA_MTU + 14U &&
             ctx->receive) { ctx->receive(ctx->user, frame.payload, frame.payload_length); }
+        return STM_OK;
+    }
+    if (frame.if_type == ESP_HOSTED_AP_IF_TYPE) {
+        if (frame.payload_length >= 14U && frame.payload_length <= ESP_HOSTED_STA_MTU + 14U &&
+            ctx->ap_receive) { ctx->ap_receive(ctx->ap_user, frame.payload, frame.payload_length); }
         return STM_OK;
     }
     if (frame.if_type == PRIV_IF && frame.payload_length >= 2U && frame.payload[0] == 0x22U) {
@@ -116,8 +137,70 @@ static stm_err_t consume(struct esp_hosted_context *ctx)
     if (field(p, rpc_len, 1U, 0U, &body, &body_len, &type) != 1 ||
         field(p, rpc_len, 2U, 0U, &body, &body_len, &id) != 1) { return STM_ERR_VERIFY; }
     if (type == 3U) {
-        if (id == WIFI_CONNECTED_EVENT) { link_change(ctx, 1U); }
-        if (id == WIFI_DISCONNECTED_EVENT) { link_change(ctx, 0U); }
+        const uint8_t *evt = NULL, *nested = NULL; size_t evt_len = 0U, nested_len = 0U;
+        uint64_t val = 0U;
+        eh_wifi_event_t event = {0};
+        if (field(p, rpc_len, (uint32_t)id, 2U, &evt, &evt_len, &val) != 1) {
+            return STM_ERR_VERIFY;
+        }
+        if (id == WIFI_CONNECTED_EVENT) {
+            event.id = EH_WIFI_EVENT_STA_CONNECTED;
+            if (field(evt, evt_len, 2U, 2U, &nested, &nested_len, &val) != 1) {
+                return STM_ERR_VERIFY;
+            }
+            ctx->last_disconnect_reason = 0U;
+            link_change(ctx, 1U);
+        } else if (id == WIFI_DISCONNECTED_EVENT) {
+            event.id = EH_WIFI_EVENT_STA_DISCONNECTED;
+            if (field(evt, evt_len, 2U, 2U, &nested, &nested_len, &val) != 1) {
+                return STM_ERR_VERIFY;
+            }
+            val = 0U;
+            if (field(nested, nested_len, 4U, 0U, &evt, &evt_len, &val) < 0 ||
+                val > UINT32_MAX) { return STM_ERR_VERIFY; }
+            event.reason = (uint32_t)val;
+            ctx->last_disconnect_reason = event.reason;
+            link_change(ctx, 0U);
+        } else if (id == WIFI_SCAN_DONE_EVENT) {
+            event.id = EH_WIFI_EVENT_SCAN_DONE;
+            if (field(evt, evt_len, 2U, 2U, &nested, &nested_len, &val) != 1) {
+                return STM_ERR_VERIFY;
+            }
+            val = 0U;
+            if (field(nested, nested_len, 1U, 0U, &evt, &evt_len, &val) < 0 ||
+                val > UINT32_MAX) { return STM_ERR_VERIFY; }
+            event.scan_status = (uint32_t)val;
+            val = 0U;
+            if (field(nested, nested_len, 2U, 0U, &evt, &evt_len, &val) < 0 ||
+                val > UINT32_MAX) { return STM_ERR_VERIFY; }
+            event.scan_count = (uint32_t)val;
+            if (!ctx->scan_pending) { return STM_OK; } /* stale event after stop */
+            ctx->scan_pending = 0U;
+            ctx->scan_done = (uint8_t)(event.scan_status == 0U);
+        } else if (id == WIFI_NO_ARGS_EVENT) {
+            if (field(evt, evt_len, 2U, 0U, &nested, &nested_len, &val) != 1) {
+                return STM_ERR_VERIFY;
+            }
+            if (val != 12U && val != 13U) { return STM_OK; }
+            event.id = val == 12U ? EH_WIFI_EVENT_AP_STARTED : EH_WIFI_EVENT_AP_STOPPED;
+            ap_link_change(ctx, val == 12U);
+        } else if (id == WIFI_AP_CLIENT_CONNECTED_EVENT ||
+                   id == WIFI_AP_CLIENT_DISCONNECTED_EVENT) {
+            event.id = id == WIFI_AP_CLIENT_CONNECTED_EVENT ?
+                EH_WIFI_EVENT_AP_CLIENT_CONNECTED : EH_WIFI_EVENT_AP_CLIENT_DISCONNECTED;
+            if (field(evt, evt_len, 2U, 2U, &nested, &nested_len, &val) != 1 || nested_len != 6U) {
+                return STM_ERR_VERIFY;
+            }
+            memcpy(event.client_mac, nested, 6U);
+            val = 0U;
+            if (field(evt, evt_len, 3U, 0U, &nested, &nested_len, &val) < 0) { return STM_ERR_VERIFY; }
+            event.aid = (uint16_t)val;
+            val = 0U;
+            if (id == WIFI_AP_CLIENT_DISCONNECTED_EVENT &&
+                field(evt, evt_len, 5U, 0U, &nested, &nested_len, &val) < 0) { return STM_ERR_VERIFY; }
+            event.reason = (uint32_t)val;
+        } else { return STM_OK; }
+        emit_wifi_event(ctx, &event);
         return STM_OK;
     }
     if (type != 2U || id > UINT16_MAX ||
@@ -194,7 +277,8 @@ static stm_err_t request(struct esp_hosted_context *ctx, uint16_t id,
             ctx->info.last_rpc_status_present = 1U;
             ctx->info.last_rpc_status = (uint32_t)status;
         }
-        if (has < 0 || (has == 1 && status != 0U)) { err = STM_ERR_IO; }
+        if (has < 0) { err = STM_ERR_VERIFY; }
+        else if (has == 1 && status != 0U) { err = STM_ERR_IO; }
         if (err == STM_OK && out && out_len) {
             if (*out_len < ctx->response_length) { err = STM_ERR_OUT_OF_RANGE; }
             else { memcpy(out, ctx->response_data, ctx->response_length);
@@ -208,7 +292,10 @@ stm_err_t esp_hosted_start(esp_hosted_handle_t handle, uint32_t timeout_ms)
 {
     if (!handle || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     handle->negotiated = 0U; handle->initialized = 0U;
-    handle->wifi_initialized = 0U; link_change(handle, 0U);
+    handle->wifi_initialized = handle->wifi_started = handle->wifi_mode = 0U;
+    handle->scan_pending = handle->scan_done = 0U;
+    handle->last_disconnect_reason = 0U; link_change(handle, 0U);
+    ap_link_change(handle, 0U);
     stm_err_t err = esp_hosted_reset(handle, 10U, 100U);
     if (err == STM_OK) { err = esp_hosted_wait_handshake(handle, timeout_ms); }
     uint32_t start = HAL_GetTick();
@@ -239,44 +326,6 @@ stm_err_t esp_hosted_get_version(esp_hosted_handle_t h, esp_hosted_version_t *v)
     if (!h->initialized) { return STM_ERR_INVALID_STATE; }
     *v = h->version; return STM_OK;
 }
-static stm_err_t wifi_setup(struct esp_hosted_context *h, uint32_t timeout_ms)
-{
-    if (h->wifi_initialized) { return STM_OK; }
-    uint8_t cfg[96], body[112]; size_t n = 0;
-    n += put_num(cfg + n, 1U, 10U); n += put_num(cfg + n, 2U, 32U);
-    n += put_num(cfg + n, 3U, 1U); n += put_num(cfg + n, 5U, 32U);
-    n += put_num(cfg + n, 8U, 1U); n += put_num(cfg + n, 9U, 1U);
-    n += put_num(cfg + n, 11U, 1U); n += put_num(cfg + n, 13U, 6U);
-    n += put_num(cfg + n, 15U, 752U); n += put_num(cfg + n, 16U, 32U);
-    n += put_num(cfg + n, 20U, 0x1F2F3F4FU);
-    size_t len = put_bytes(body, 1U, cfg, n);
-    stm_err_t err = request(h, 278U, body, len, NULL, NULL, timeout_ms);
-    if (err == STM_OK) { err = request(h, 259U, NULL, 0U, NULL, NULL, timeout_ms); }
-    n = put_num(body, 1U, 1U); /* WIFI_MODE_STA */
-    if (err == STM_OK) { err = request(h, 260U, body, n, NULL, NULL, timeout_ms); }
-    if (err == STM_OK) { err = request(h, 280U, NULL, 0U, NULL, NULL, timeout_ms); }
-    memset(cfg, 0, sizeof(cfg)); memset(body, 0, sizeof(body));
-    if (err == STM_OK) { h->wifi_initialized = 1U; }
-    return err;
-}
-stm_err_t esp_hosted_get_sta_mac(esp_hosted_handle_t h, uint8_t mac[6])
-{
-    if (!h || !mac) { return STM_ERR_INVALID_ARG; }
-    if (!h->initialized) { return STM_ERR_INVALID_STATE; }
-    stm_err_t err = wifi_setup(h, 5000U);
-    if (err != STM_OK) { return err; }
-    uint8_t body[4], response[32]; size_t len = sizeof(response);
-    size_t n = put_num(body, 1U, 0U); /* WIFI_IF_STA */
-    err = request(h, 257U, body, n, response, &len, 5000U);
-    if (err != STM_OK) { return err; }
-    const uint8_t *bytes = NULL; size_t count = 0; uint64_t number = 0;
-    if (field(response, len, 1U, 2U, &bytes, &count, &number) != 1 || count != 6U) {
-        return STM_ERR_VERIFY;
-    }
-    memcpy(h->mac, bytes, 6U); memcpy(mac, bytes, 6U);
-    return STM_OK;
-}
-uint8_t esp_hosted_is_connected(esp_hosted_handle_t h) { return h ? h->connected : 0U; }
 stm_err_t esp_hosted_send(esp_hosted_handle_t h, const uint8_t *frame, size_t length)
 {
     if (!h || !frame || length < 14U || length > ESP_HOSTED_STA_MTU + 14U) {
@@ -289,35 +338,266 @@ stm_err_t esp_hosted_send(esp_hosted_handle_t h, const uint8_t *frame, size_t le
     if (err == STM_OK) { err = esp_hosted_wait_handshake(h, 1000U); }
     return err == STM_OK ? exchange(h, h->config.tx_buffer) : err;
 }
-stm_err_t esp_hosted_connect(esp_hosted_handle_t h, const char *ssid,
-                             const char *password, uint32_t timeout_ms)
+
+static size_t bounded_string(const char *s, size_t max)
 {
-    if (!h || !ssid || !password || !timeout_ms || !*ssid || strlen(ssid) > 32U ||
-        strlen(password) > 64U) { return STM_ERR_INVALID_ARG; }
+    size_t n = 0U;
+    while (n <= max && s[n] != '\0') { ++n; }
+    return n;
+}
+
+stm_err_t eh_wifi_init(esp_hosted_handle_t h, uint32_t timeout_ms)
+{
+    if (!h || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     if (!h->initialized) { return STM_ERR_INVALID_STATE; }
-    stm_err_t err = wifi_setup(h, timeout_ms);
-    if (err != STM_OK) { return err; }
-    uint8_t station[112], wifi_cfg[128], body[144]; size_t n = 0;
-    n += put_bytes(station + n, 1U, (const uint8_t *)ssid, strlen(ssid));
-    n += put_bytes(station + n, 2U, (const uint8_t *)password, strlen(password));
-    size_t wifi_len = put_bytes(wifi_cfg, 2U, station, n);
-    size_t body_len = put_bytes(body, 2U, wifi_cfg, wifi_len);
-    err = request(h, 284U, body, body_len, NULL, NULL, timeout_ms);
-    memset(station, 0, sizeof(station)); memset(wifi_cfg, 0, sizeof(wifi_cfg));
-    memset(body, 0, sizeof(body));
-    if (err == STM_OK) { err = request(h, 282U, NULL, 0U, NULL, NULL, timeout_ms); }
-    uint32_t start = HAL_GetTick();
-    while (err == STM_OK && !h->connected && HAL_GetTick() - start < timeout_ms) {
-        err = esp_hosted_poll(h);
-    }
-    if (err == STM_OK && !h->connected) { err = STM_ERR_TIMEOUT; }
+    if (h->wifi_initialized) { return STM_OK; }
+    uint8_t cfg[96], body[112]; size_t n = 0U;
+    n += put_num(cfg + n, 1U, 10U); n += put_num(cfg + n, 2U, 32U);
+    n += put_num(cfg + n, 3U, 1U); n += put_num(cfg + n, 5U, 32U);
+    n += put_num(cfg + n, 8U, 1U); n += put_num(cfg + n, 9U, 1U);
+    n += put_num(cfg + n, 11U, 1U); n += put_num(cfg + n, 13U, 6U);
+    n += put_num(cfg + n, 15U, 752U); n += put_num(cfg + n, 16U, 32U);
+    n += put_num(cfg + n, 20U, 0x1F2F3F4FU);
+    size_t len = put_bytes(body, 1U, cfg, n);
+    stm_err_t err = request(h, 278U, body, len, NULL, NULL, timeout_ms);
+    if (err == STM_OK) { err = request(h, 259U, NULL, 0U, NULL, NULL, timeout_ms); }
+    memset(cfg, 0, sizeof(cfg)); memset(body, 0, sizeof(body));
+    if (err == STM_OK) { h->wifi_initialized = 1U; }
     return err;
 }
-stm_err_t esp_hosted_disconnect(esp_hosted_handle_t h)
+stm_err_t eh_wifi_set_mode(esp_hosted_handle_t h, eh_wifi_mode_t mode, uint32_t timeout_ms)
 {
-    if (!h) { return STM_ERR_INVALID_ARG; }
-    if (!h->initialized) { return STM_ERR_INVALID_STATE; }
-    stm_err_t err = request(h, 283U, NULL, 0U, NULL, NULL, 5000U);
+    if (!h || !timeout_ms || mode > EH_WIFI_MODE_APSTA) { return STM_ERR_INVALID_ARG; }
+    if (!h->wifi_initialized) { return STM_ERR_INVALID_STATE; }
+    uint8_t body[4]; size_t n = put_num(body, 1U, (uint32_t)mode);
+    stm_err_t err = request(h, 260U, body, n, NULL, NULL, timeout_ms);
+    if (err == STM_OK) {
+        h->wifi_mode = (uint8_t)mode;
+        if (!(mode & EH_WIFI_MODE_STA)) { link_change(h, 0U); h->scan_pending = h->scan_done = 0U; }
+        if (!(mode & EH_WIFI_MODE_AP)) { ap_link_change(h, 0U); }
+    }
+    return err;
+}
+stm_err_t eh_wifi_set_config(esp_hosted_handle_t h, eh_wifi_if_t iface,
+                             const eh_wifi_config_t *config, uint32_t timeout_ms)
+{
+    if (!h || !config || !timeout_ms || iface > EH_WIFI_IF_AP) { return STM_ERR_INVALID_ARG; }
+    if (!h->wifi_initialized || h->wifi_mode == EH_WIFI_MODE_NULL ||
+        (iface == EH_WIFI_IF_STA && !(h->wifi_mode & EH_WIFI_MODE_STA)) ||
+        (iface == EH_WIFI_IF_AP && !(h->wifi_mode & EH_WIFI_MODE_AP))) { return STM_ERR_INVALID_STATE; }
+    uint8_t inner[128] = {0}, cfg[152] = {0}, body[168] = {0};
+    size_t n = 0U, ssid_len, pass_len;
+    if (iface == EH_WIFI_IF_STA) {
+        ssid_len = bounded_string(config->sta.ssid, 32U);
+        pass_len = bounded_string(config->sta.password, 64U);
+        if (!ssid_len || ssid_len > 32U || pass_len > 64U) { return STM_ERR_INVALID_CONFIG; }
+        n += put_bytes(inner + n, 1U, (const uint8_t *)config->sta.ssid, ssid_len);
+        n += put_bytes(inner + n, 2U, (const uint8_t *)config->sta.password, pass_len);
+    } else {
+        ssid_len = bounded_string(config->ap.ssid, 32U);
+        pass_len = bounded_string(config->ap.password, 64U);
+        if (!ssid_len || ssid_len > 32U || (pass_len && (pass_len < 8U || pass_len > 63U)) ||
+            config->ap.channel > 13U || config->ap.max_connections > 4U) { return STM_ERR_INVALID_CONFIG; }
+        n += put_bytes(inner + n, 1U, (const uint8_t *)config->ap.ssid, ssid_len);
+        n += put_bytes(inner + n, 2U, (const uint8_t *)config->ap.password, pass_len);
+        n += put_num(inner + n, 4U, config->ap.channel ? config->ap.channel : 1U);
+        n += put_num(inner + n, 5U, pass_len ? 3U : 0U); /* OPEN or WPA2-PSK */
+        n += put_num(inner + n, 6U, config->ap.hidden ? 1U : 0U);
+        n += put_num(inner + n, 7U, config->ap.max_connections ? config->ap.max_connections : 4U);
+    }
+    size_t cfg_len = put_bytes(cfg, iface == EH_WIFI_IF_STA ? 2U : 1U, inner, n);
+    n = put_num(body, 1U, (uint32_t)iface);
+    n += put_bytes(body + n, 2U, cfg, cfg_len);
+    stm_err_t err = request(h, 284U, body, n, NULL, NULL, timeout_ms);
+    memset(inner, 0, sizeof(inner)); memset(cfg, 0, sizeof(cfg)); memset(body, 0, sizeof(body));
+    return err;
+}
+stm_err_t eh_wifi_start(esp_hosted_handle_t h, uint32_t timeout_ms)
+{
+    if (!h || !timeout_ms) { return STM_ERR_INVALID_ARG; }
+    if (!h->wifi_initialized || !h->wifi_mode) { return STM_ERR_INVALID_STATE; }
+    if (h->wifi_started) { return STM_OK; }
+    stm_err_t err = request(h, 280U, NULL, 0U, NULL, NULL, timeout_ms);
+    if (err == STM_OK) { h->wifi_started = 1U; }
+    return err;
+}
+stm_err_t eh_wifi_stop(esp_hosted_handle_t h, uint32_t timeout_ms)
+{
+    if (!h || !timeout_ms) { return STM_ERR_INVALID_ARG; }
+    if (!h->wifi_started) { return STM_ERR_INVALID_STATE; }
+    stm_err_t err = request(h, 281U, NULL, 0U, NULL, NULL, timeout_ms);
+    if (err == STM_OK) { h->wifi_started = 0U; h->scan_pending = h->scan_done = 0U; h->last_disconnect_reason = 0U;
+        link_change(h, 0U); ap_link_change(h, 0U); }
+    return err;
+}
+stm_err_t eh_wifi_connect(esp_hosted_handle_t h, uint32_t timeout_ms)
+{
+    if (!h || !timeout_ms) { return STM_ERR_INVALID_ARG; }
+    if (!h->wifi_started || !(h->wifi_mode & EH_WIFI_MODE_STA)) { return STM_ERR_INVALID_STATE; }
+    return request(h, 282U, NULL, 0U, NULL, NULL, timeout_ms);
+}
+stm_err_t eh_wifi_disconnect(esp_hosted_handle_t h, uint32_t timeout_ms)
+{
+    if (!h || !timeout_ms) { return STM_ERR_INVALID_ARG; }
+    if (!h->wifi_started || !(h->wifi_mode & EH_WIFI_MODE_STA)) { return STM_ERR_INVALID_STATE; }
+    stm_err_t err = request(h, 283U, NULL, 0U, NULL, NULL, timeout_ms);
     if (err == STM_OK) { link_change(h, 0U); }
     return err;
+}
+uint8_t eh_wifi_is_connected(esp_hosted_handle_t h) { return h ? h->connected : 0U; }
+stm_err_t eh_wifi_get_status(esp_hosted_handle_t h, eh_wifi_status_t *status)
+{
+    if (!h || !status) { return STM_ERR_INVALID_ARG; }
+    *status = (eh_wifi_status_t){.mode = (eh_wifi_mode_t)h->wifi_mode,
+        .started = h->wifi_started, .sta_connected = h->connected,
+        .ap_started = h->ap_up, .scan_pending = h->scan_pending,
+        .last_disconnect_reason = h->last_disconnect_reason};
+    return STM_OK;
+}
+
+stm_err_t eh_wifi_set_event_callback(esp_hosted_handle_t h, eh_wifi_event_fn callback, void *user)
+{
+    if (!h) { return STM_ERR_INVALID_ARG; }
+    h->wifi_event = callback; h->wifi_event_user = user; return STM_OK;
+}
+stm_err_t eh_wifi_set_ap_rx_callback(esp_hosted_handle_t h, eh_wifi_ap_rx_fn callback, void *user)
+{
+    if (!h) { return STM_ERR_INVALID_ARG; }
+    h->ap_receive = callback; h->ap_user = user; return STM_OK;
+}
+stm_err_t eh_wifi_set_ap_link_callback(esp_hosted_handle_t h, eh_wifi_ap_link_fn callback, void *user)
+{
+    if (!h) { return STM_ERR_INVALID_ARG; }
+    h->ap_link = callback; h->ap_link_user = user; return STM_OK;
+}
+stm_err_t eh_wifi_get_mac(esp_hosted_handle_t h, eh_wifi_if_t iface, uint8_t mac[6])
+{
+    if (!h || !mac || iface > EH_WIFI_IF_AP) { return STM_ERR_INVALID_ARG; }
+    if (!h->wifi_initialized) { return STM_ERR_INVALID_STATE; }
+    uint8_t body[4], response[32]; size_t len = sizeof(response);
+    size_t n = put_num(body, 1U, (uint32_t)iface);
+    stm_err_t err = request(h, 257U, body, n, response, &len, 5000U);
+    if (err != STM_OK) { return err; }
+    const uint8_t *bytes = NULL; size_t count = 0U; uint64_t number = 0U;
+    if (field(response, len, 1U, 2U, &bytes, &count, &number) != 1 || count != 6U) { return STM_ERR_VERIFY; }
+    memcpy(mac, bytes, 6U);
+    if (iface == EH_WIFI_IF_STA) { memcpy(h->mac, bytes, 6U); }
+    return STM_OK;
+}
+stm_err_t eh_wifi_ap_send(esp_hosted_handle_t h, const uint8_t *frame, size_t length)
+{
+    if (!h || !frame || length < 14U || length > ESP_HOSTED_STA_MTU + 14U) { return STM_ERR_INVALID_ARG; }
+    if (!h->wifi_started || !(h->wifi_mode & EH_WIFI_MODE_AP)) { return STM_ERR_INVALID_STATE; }
+    stm_err_t err = esp_hosted_encode_frame(h, ESP_HOSTED_AP_IF_TYPE, 0U, ++h->sequence,
+                                             frame, length, h->config.tx_buffer, ESP_HOSTED_FRAME_SIZE);
+    if (err == STM_OK) { err = esp_hosted_wait_handshake(h, 1000U); }
+    return err == STM_OK ? exchange(h, h->config.tx_buffer) : err;
+}
+
+stm_err_t eh_wifi_scan_start(esp_hosted_handle_t h,
+                             const eh_wifi_scan_config_t *config, uint32_t timeout_ms)
+{
+    if (!h || !timeout_ms) { return STM_ERR_INVALID_ARG; }
+    if (!h->wifi_started || !(h->wifi_mode & EH_WIFI_MODE_STA) || h->scan_pending) {
+        return STM_ERR_INVALID_STATE;
+    }
+    uint8_t cfg[64], body[80]; size_t n = 0U, body_len = 0U;
+    if (config) {
+        /* CP 3.0.9 requires both scan_time and scan_time.active whenever
+         * config_set is true. Otherwise it rejects the RPC before scanning. */
+        uint8_t active[8], scan_time[16];
+        size_t active_len = put_num(active, 1U, 30U);
+        active_len += put_num(active + active_len, 2U, 120U);
+        size_t time_len = put_bytes(scan_time, 1U, active, active_len);
+        if (config->channel > 14U) { return STM_ERR_INVALID_CONFIG; }
+        if (config->ssid) {
+            size_t len = bounded_string(config->ssid, 32U);
+            if (len > 32U) { return STM_ERR_INVALID_CONFIG; }
+            n += put_bytes(cfg + n, 1U, (const uint8_t *)config->ssid, len);
+        }
+        if (config->channel) { n += put_num(cfg + n, 3U, config->channel); }
+        if (config->show_hidden) { n += put_num(cfg + n, 4U, 1U); }
+        n += put_bytes(cfg + n, 6U, scan_time, time_len);
+        body_len += put_bytes(body + body_len, 1U, cfg, n);
+        body_len += put_num(body + body_len, 3U, 1U);
+    }
+    h->scan_pending = 1U; h->scan_done = 0U;
+    stm_err_t err = request(h, 286U, body, body_len, NULL, NULL, timeout_ms);
+    if (err != STM_OK) { h->scan_pending = h->scan_done = 0U; }
+    return err;
+}
+static stm_err_t parse_ap_record(const uint8_t *raw, size_t raw_len,
+                                 eh_wifi_ap_record_t *record)
+{
+    const uint8_t *bytes = NULL; size_t bytes_len = 0U; uint64_t number = 0U;
+    eh_wifi_ap_record_t parsed = {0};
+    if (field(raw, raw_len, 1U, 2U, &bytes, &bytes_len, &number) != 1 || bytes_len != 6U) { return STM_ERR_VERIFY; }
+    memcpy(parsed.bssid, bytes, 6U);
+    if (field(raw, raw_len, 2U, 2U, &bytes, &bytes_len, &number) == 1) {
+        if (bytes_len > 32U) { return STM_ERR_VERIFY; }
+        memcpy(parsed.ssid, bytes, bytes_len);
+    }
+    number = 0U;
+    if (field(raw, raw_len, 3U, 0U, &bytes, &bytes_len, &number) < 0 || number > UINT8_MAX) { return STM_ERR_VERIFY; }
+    parsed.channel = (uint8_t)number;
+    number = 0U;
+    if (field(raw, raw_len, 5U, 0U, &bytes, &bytes_len, &number) < 0) { return STM_ERR_VERIFY; }
+    parsed.rssi = (int8_t)(int32_t)number;
+    number = 0U;
+    if (field(raw, raw_len, 6U, 0U, &bytes, &bytes_len, &number) < 0 || number > UINT8_MAX) { return STM_ERR_VERIFY; }
+    parsed.authmode = (uint8_t)number;
+    *record = parsed;
+    return STM_OK;
+}
+stm_err_t eh_wifi_sta_get_ap_info(esp_hosted_handle_t h, eh_wifi_ap_record_t *record,
+                                  uint32_t timeout_ms)
+{
+    if (!h || !record || !timeout_ms) { return STM_ERR_INVALID_ARG; }
+    if (!h->wifi_started || !(h->wifi_mode & EH_WIFI_MODE_STA) || !h->connected) {
+        return STM_ERR_INVALID_STATE;
+    }
+    uint8_t response[128]; size_t len = sizeof(response);
+    stm_err_t err = request(h, 294U, NULL, 0U, response, &len, timeout_ms);
+    if (err != STM_OK) { return err; }
+    const uint8_t *raw = NULL; size_t raw_len = 0U; uint64_t unused = 0U;
+    if (field(response, len, 2U, 2U, &raw, &raw_len, &unused) != 1) { return STM_ERR_VERIFY; }
+    return parse_ap_record(raw, raw_len, record);
+}
+stm_err_t eh_wifi_scan_stop(esp_hosted_handle_t h, uint32_t timeout_ms)
+{
+    if (!h || !timeout_ms) { return STM_ERR_INVALID_ARG; }
+    if (!h->wifi_started || !(h->wifi_mode & EH_WIFI_MODE_STA) || !h->scan_pending) {
+        return STM_ERR_INVALID_STATE;
+    }
+    stm_err_t err = request(h, 287U, NULL, 0U, NULL, NULL, timeout_ms);
+    if (err == STM_OK) { h->scan_pending = h->scan_done = 0U; }
+    return err;
+}
+stm_err_t eh_wifi_scan_get_results(esp_hosted_handle_t h, eh_wifi_ap_record_t *records,
+                                   size_t capacity, size_t *count, uint32_t timeout_ms)
+{
+    if (!h || !count || !timeout_ms || (capacity && !records)) { return STM_ERR_INVALID_ARG; }
+    *count = 0U;
+    if (!h->scan_done || h->scan_pending) { return STM_ERR_INVALID_STATE; }
+    uint8_t response[32]; size_t len = sizeof(response);
+    stm_err_t err = request(h, 288U, NULL, 0U, response, &len, timeout_ms);
+    if (err != STM_OK) { return err; }
+    const uint8_t *data = NULL; size_t size = 0U; uint64_t available = 0U;
+    if (field(response, len, 2U, 0U, &data, &size, &available) < 0 ||
+        available > UINT16_MAX) { return STM_ERR_VERIFY; }
+    /* The CP's get-records RPC consumes its scan list. A caller must supply room
+     * for every record; return the required capacity without touching the list. */
+    if (available > capacity) { *count = (size_t)available; return STM_ERR_OUT_OF_RANGE; }
+    size_t total = (size_t)available;
+    for (size_t i = 0; i < total; ++i) {
+        uint8_t record[512]; len = sizeof(record);
+        err = request(h, 351U, NULL, 0U, record, &len, timeout_ms);
+        if (err != STM_OK) { return err; }
+        if (field(record, len, 2U, 2U, &data, &size, &available) != 1) { return STM_ERR_VERIFY; }
+        err = parse_ap_record(data, size, &records[i]);
+        if (err != STM_OK) { return err; }
+        ++*count;
+    }
+    h->scan_done = 0U;
+    return STM_OK;
 }
