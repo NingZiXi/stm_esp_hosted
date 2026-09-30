@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define STM_ESP_HOSTED_VERSION       "0.1.0"
+#define STM_ESP_HOSTED_VERSION       "0.4.0"
 #define ESP_HOSTED_FRAME_SIZE        1600U
 #define ESP_HOSTED_FRAME_HEADER_SIZE  12U
 #define ESP_HOSTED_FRAME_CHECKSUM_OFFSET 6U
@@ -233,6 +233,15 @@ typedef enum {
     EH_WIFI_MODE_APSTA = 3,
 } eh_wifi_mode_t;
 typedef enum { EH_WIFI_IF_STA = 0, EH_WIFI_IF_AP = 1 } eh_wifi_if_t;
+/** Optional STA reconnect policy. max_attempts=0 means unlimited. */
+typedef struct {
+    uint32_t initial_delay_ms;
+    uint32_t max_delay_ms;
+    uint32_t association_timeout_ms;
+    uint32_t rpc_timeout_ms;
+    uint16_t max_attempts;
+    uint8_t enabled;
+} eh_wifi_reconnect_config_t;
 typedef struct {
     char ssid[33];
     char password[65];
@@ -283,6 +292,9 @@ typedef struct {
     uint8_t ap_started;
     uint8_t scan_pending;
     uint32_t last_disconnect_reason;
+    uint16_t reconnect_attempts;
+    uint8_t reconnect_pending;
+    uint8_t reconnect_enabled;
 } eh_wifi_status_t;
 typedef enum {
     EH_WIFI_EVENT_SCAN_DONE,
@@ -323,6 +335,11 @@ stm_err_t eh_wifi_start(esp_hosted_handle_t handle, uint32_t timeout_ms);
 stm_err_t eh_wifi_stop(esp_hosted_handle_t handle, uint32_t timeout_ms);
 stm_err_t eh_wifi_connect(esp_hosted_handle_t handle, uint32_t timeout_ms);
 stm_err_t eh_wifi_disconnect(esp_hosted_handle_t handle, uint32_t timeout_ms);
+/** Set optional automatic STA reconnect policy; disabled by default. Does not initiate a first connection. */
+stm_err_t eh_wifi_set_reconnect(esp_hosted_handle_t handle,
+                                 const eh_wifi_reconnect_config_t *config);
+/** Call after esp_hosted_poll() and outside callbacks; attempts a due reconnect using the configured RPC timeout. */
+stm_err_t eh_wifi_reconnect_update(esp_hosted_handle_t handle);
 uint8_t eh_wifi_is_connected(esp_hosted_handle_t handle);
 /** Read cached state without sending an RPC. */
 stm_err_t eh_wifi_get_status(esp_hosted_handle_t handle, eh_wifi_status_t *status);

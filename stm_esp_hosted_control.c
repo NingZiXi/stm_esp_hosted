@@ -77,10 +77,36 @@ static int field(const uint8_t *data, size_t len, uint32_t wanted, uint8_t wire,
     return found;
 }
 
+static void reconnect_clear(struct esp_hosted_context *ctx)
+{
+    ctx->reconnect_armed = 0U;
+    ctx->reconnect_waiting = 0U;
+    ctx->connect_pending = 0U;
+    ctx->reconnect_attempts = 0U;
+    ctx->reconnect_delay = ctx->reconnect_config.initial_delay_ms;
+}
+static void reconnect_schedule(struct esp_hosted_context *ctx)
+{
+    ctx->connect_pending = 0U;
+    if (!ctx->reconnect_config.enabled || !ctx->reconnect_armed ||
+        (ctx->reconnect_config.max_attempts &&
+         ctx->reconnect_attempts >= ctx->reconnect_config.max_attempts)) {
+        ctx->reconnect_waiting = 0U;
+        return;
+    }
+    ctx->reconnect_waiting = 1U;
+    ctx->reconnect_since = HAL_GetTick();
+    if (!ctx->reconnect_delay) { ctx->reconnect_delay = ctx->reconnect_config.initial_delay_ms; }
+}
 static void link_change(struct esp_hosted_context *ctx, uint8_t connected)
 {
     if (ctx->connected != connected) {
         ctx->connected = connected;
+        if (connected) {
+            ctx->reconnect_waiting = ctx->connect_pending = 0U;
+            ctx->reconnect_attempts = 0U;
+            ctx->reconnect_delay = ctx->reconnect_config.initial_delay_ms;
+        } else if (ctx->reconnect_armed) { reconnect_schedule(ctx); }
         if (ctx->link) { ctx->link(ctx->user, connected); }
     }
 }
@@ -167,7 +193,9 @@ static stm_err_t consume(struct esp_hosted_context *ctx)
                 val > UINT32_MAX) { return STM_ERR_VERIFY; }
             event.reason = (uint32_t)val;
             ctx->last_disconnect_reason = event.reason;
+            uint8_t pending = ctx->connect_pending;
             link_change(ctx, 0U);
+            if (pending && !ctx->reconnect_waiting) { reconnect_schedule(ctx); }
         } else if (id == WIFI_SCAN_DONE_EVENT) {
             event.id = EH_WIFI_EVENT_SCAN_DONE;
             if (field(evt, evt_len, 2U, 2U, &nested, &nested_len, &val) != 1) {
@@ -310,7 +338,9 @@ stm_err_t esp_hosted_start(esp_hosted_handle_t handle, uint32_t timeout_ms)
     handle->negotiated = 0U; handle->initialized = 0U;
     handle->wifi_initialized = handle->wifi_started = handle->wifi_mode = 0U;
     handle->scan_pending = handle->scan_done = 0U;
-    handle->last_disconnect_reason = 0U; link_change(handle, 0U);
+    handle->last_disconnect_reason = 0U;
+    reconnect_clear(handle);
+    link_change(handle, 0U);
     ap_link_change(handle, 0U);
     stm_err_t err = esp_hosted_reset(handle, 10U, 100U);
     if (err == STM_OK) { err = esp_hosted_wait_handshake(handle, timeout_ms); }
@@ -389,7 +419,7 @@ stm_err_t eh_wifi_set_mode(esp_hosted_handle_t h, eh_wifi_mode_t mode, uint32_t 
     stm_err_t err = request(h, 260U, body, n, NULL, NULL, timeout_ms);
     if (err == STM_OK) {
         h->wifi_mode = (uint8_t)mode;
-        if (!(mode & EH_WIFI_MODE_STA)) { link_change(h, 0U); h->scan_pending = h->scan_done = 0U; }
+        if (!(mode & EH_WIFI_MODE_STA)) { reconnect_clear(h); link_change(h, 0U); h->scan_pending = h->scan_done = 0U; }
         if (!(mode & EH_WIFI_MODE_AP)) { ap_link_change(h, 0U); }
     }
     return err;
@@ -541,6 +571,7 @@ stm_err_t eh_wifi_stop(esp_hosted_handle_t h, uint32_t timeout_ms)
 {
     if (!h || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_started) { return STM_ERR_INVALID_STATE; }
+    reconnect_clear(h);
     stm_err_t err = request(h, 281U, NULL, 0U, NULL, NULL, timeout_ms);
     if (err == STM_OK) { h->wifi_started = 0U; h->scan_pending = h->scan_done = 0U; h->last_disconnect_reason = 0U;
         link_change(h, 0U); ap_link_change(h, 0U); }
@@ -550,14 +581,74 @@ stm_err_t eh_wifi_connect(esp_hosted_handle_t h, uint32_t timeout_ms)
 {
     if (!h || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_started || !(h->wifi_mode & EH_WIFI_MODE_STA)) { return STM_ERR_INVALID_STATE; }
-    return request(h, 282U, NULL, 0U, NULL, NULL, timeout_ms);
+    stm_err_t err = request(h, 282U, NULL, 0U, NULL, NULL, timeout_ms);
+    h->reconnect_armed = h->reconnect_config.enabled;
+    h->reconnect_attempts = 0U;
+    h->reconnect_delay = h->reconnect_config.initial_delay_ms;
+    h->reconnect_waiting = h->connect_pending = 0U;
+    if (err == STM_OK && !h->connected) {
+        h->connect_pending = 1U;
+        h->reconnect_since = HAL_GetTick();
+    } else if (err != STM_OK && !h->connected) { reconnect_schedule(h); }
+    return err;
 }
 stm_err_t eh_wifi_disconnect(esp_hosted_handle_t h, uint32_t timeout_ms)
 {
     if (!h || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_started || !(h->wifi_mode & EH_WIFI_MODE_STA)) { return STM_ERR_INVALID_STATE; }
+    /* Explicit disconnect cancels retries even when the CP rejects the request. */
+    reconnect_clear(h);
     stm_err_t err = request(h, 283U, NULL, 0U, NULL, NULL, timeout_ms);
     if (err == STM_OK) { link_change(h, 0U); }
+    return err;
+}
+stm_err_t eh_wifi_set_reconnect(esp_hosted_handle_t h,
+                                const eh_wifi_reconnect_config_t *config)
+{
+    if (!h || !config || (config->enabled != 0U && config->enabled != 1U)) {
+        return STM_ERR_INVALID_ARG;
+    }
+    if (config->enabled && (!config->initial_delay_ms ||
+        config->initial_delay_ms > config->max_delay_ms ||
+        config->max_delay_ms > INT32_MAX || !config->association_timeout_ms ||
+        config->association_timeout_ms > INT32_MAX || !config->rpc_timeout_ms ||
+        config->rpc_timeout_ms > INT32_MAX)) {
+        return STM_ERR_INVALID_ARG;
+    }
+    h->reconnect_config = *config;
+    reconnect_clear(h);
+    /* Only an explicit connect call arms reconnection. A live connection can be armed now. */
+    if (config->enabled && h->connected) { h->reconnect_armed = 1U; }
+    return STM_OK;
+}
+stm_err_t eh_wifi_reconnect_update(esp_hosted_handle_t h)
+{
+    if (!h) { return STM_ERR_INVALID_ARG; }
+    if (!h->reconnect_config.enabled || !h->reconnect_armed || !h->wifi_started ||
+        !(h->wifi_mode & EH_WIFI_MODE_STA) || h->connected) { return STM_OK; }
+    if (h->connect_pending) {
+        if ((uint32_t)(HAL_GetTick() - h->reconnect_since) <
+            h->reconnect_config.association_timeout_ms) { return STM_OK; }
+        reconnect_schedule(h);
+    }
+    if (!h->reconnect_waiting ||
+        (uint32_t)(HAL_GetTick() - h->reconnect_since) < h->reconnect_delay) {
+        return STM_OK;
+    }
+    h->reconnect_waiting = 0U;
+    if (h->reconnect_attempts < UINT16_MAX) { ++h->reconnect_attempts; }
+    /* Events may arrive inside request(): advance the next delay first. */
+    if (h->reconnect_delay < h->reconnect_config.max_delay_ms / 2U) {
+        h->reconnect_delay *= 2U;
+    } else { h->reconnect_delay = h->reconnect_config.max_delay_ms; }
+    stm_err_t err = request(h, 282U, NULL, 0U, NULL, NULL,
+                            h->reconnect_config.rpc_timeout_ms);
+    if (err == STM_OK) {
+        if (!h->connected) {
+            h->connect_pending = 1U;
+            h->reconnect_since = HAL_GetTick();
+        }
+    } else if (!h->connected) { reconnect_schedule(h); }
     return err;
 }
 uint8_t eh_wifi_is_connected(esp_hosted_handle_t h) { return h ? h->connected : 0U; }
@@ -567,7 +658,10 @@ stm_err_t eh_wifi_get_status(esp_hosted_handle_t h, eh_wifi_status_t *status)
     *status = (eh_wifi_status_t){.mode = (eh_wifi_mode_t)h->wifi_mode,
         .started = h->wifi_started, .sta_connected = h->connected,
         .ap_started = h->ap_up, .scan_pending = h->scan_pending,
-        .last_disconnect_reason = h->last_disconnect_reason};
+        .last_disconnect_reason = h->last_disconnect_reason,
+        .reconnect_attempts = h->reconnect_attempts,
+        .reconnect_pending = (uint8_t)(h->reconnect_waiting || h->connect_pending),
+        .reconnect_enabled = h->reconnect_config.enabled};
     return STM_OK;
 }
 

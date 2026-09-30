@@ -282,7 +282,7 @@ static int test_init_timeout(void)
 
 /* The mock CP replies in the same SPI transaction and emits a later STA event. */
 static esp_hosted_handle_t mock_host;
-static unsigned mock_stage, mock_requests, mock_connect_event, mock_error_mode;
+static unsigned mock_stage, mock_requests, mock_connect_event, mock_disconnect_event, mock_error_mode;
 static unsigned query_fault, mock_mode = EH_WIFI_MODE_STA, mock_ps, mock_iface;
 /* 1=CP error, 2=missing cfg, 3=oversize SSID, 4=wrong iface,
  * 5=wrong branch, 6=malformed payload, 7=timeout, 8=stale uid,
@@ -346,6 +346,14 @@ static void mock_cp(const uint8_t *tx, uint8_t *rx, uint16_t length)
         done[17] = (uint8_t)scan_result_status;
         (void)esp_hosted_encode_frame(mock_host, 3U, 0U, 2U, done, sizeof(done), rx, length);
         scan_event_pending = 0U;
+        return;
+    }
+    if ((tx[0] & 0x0FU) == ESP_HOSTED_DUMMY_IF_TYPE && mock_disconnect_event) {
+        const uint8_t disconnected[] = {1U, 0U, 0U, 2U, 12U, 0U,
+            8U, 3U, 16U, 0x88U, 6U, 0xC2U, 0x30U, 4U, 0x12U, 2U, 0x20U, 7U};
+        (void)esp_hosted_encode_frame(mock_host, 3U, 0U, 2U, disconnected,
+                                       sizeof(disconnected), rx, length);
+        mock_disconnect_event = 0U;
         return;
     }
     if ((tx[0] & 0x0FU) == ESP_HOSTED_DUMMY_IF_TYPE && mock_connect_event) {
@@ -481,7 +489,7 @@ static int test_successful_rpc_sequence(void)
     esp_hosted_version_t version;
     uint8_t mac[6];
     TEST_ASSERT(h != NULL);
-    mock_host = h; mock_stage = mock_requests = mock_connect_event = mock_error_mode = 0U;
+    mock_host = h; mock_stage = mock_requests = mock_connect_event = mock_disconnect_event = mock_error_mode = 0U;
     mock_seen = scan_event_pending = scan_config_seen = scan_rejected = 0U;
     scan_result_status = ap_info_bad = query_fault = mock_ps = mock_iface = 0U; mock_mode = EH_WIFI_MODE_STA;
     test_hal_set_frame_callback(mock_cp);
@@ -601,6 +609,73 @@ static int test_successful_rpc_sequence(void)
     return 0;
 }
 
+
+static int test_reconnect_policy(void)
+{
+    static uint8_t tx[ESP_HOSTED_FRAME_SIZE] __attribute__((aligned(ESP_HOSTED_DMA_ALIGNMENT)));
+    static uint8_t rx[ESP_HOSTED_FRAME_SIZE] __attribute__((aligned(ESP_HOSTED_DMA_ALIGNMENT)));
+    esp_hosted_handle_t h = make_handle(tx, rx, ESP_HOSTED_DUMMY_IF_TYPE);
+    TEST_ASSERT(h != NULL);
+    mock_host = h; mock_stage = mock_requests = mock_connect_event = mock_disconnect_event = mock_error_mode = 0U;
+    mock_seen = scan_event_pending = scan_config_seen = scan_rejected = 0U;
+    scan_result_status = ap_info_bad = query_fault = mock_ps = mock_iface = 0U;
+    mock_mode = EH_WIFI_MODE_STA;
+    test_hal_set_frame_callback(mock_cp);
+    TEST_ASSERT(esp_hosted_start(h, 500U) == STM_OK);
+    TEST_ASSERT(eh_wifi_init(h, 500U) == STM_OK);
+    TEST_ASSERT(eh_wifi_set_mode(h, EH_WIFI_MODE_STA, 500U) == STM_OK);
+    TEST_ASSERT(eh_wifi_start(h, 500U) == STM_OK);
+    eh_wifi_reconnect_config_t config = {.enabled = 1U, .initial_delay_ms = 100U,
+        .max_delay_ms = 400U, .association_timeout_ms = 60U,
+        .rpc_timeout_ms = 50U, .max_attempts = 2U};
+    config.max_delay_ms = 99U;
+    TEST_ASSERT(eh_wifi_set_reconnect(h, &config) == STM_ERR_INVALID_ARG);
+    config.max_delay_ms = 400U;
+    TEST_ASSERT(eh_wifi_set_reconnect(h, &config) == STM_OK);
+    TEST_ASSERT(eh_wifi_reconnect_update(h) == STM_OK && !h->reconnect_armed);
+    TEST_ASSERT(eh_wifi_connect(h, 500U) == STM_OK && h->connect_pending);
+    mock_connect_event = 0U; /* CP accepts the request but never associates. */
+    HAL_Delay(65U);
+    TEST_ASSERT(eh_wifi_reconnect_update(h) == STM_OK && h->reconnect_waiting);
+    unsigned before = mock_requests;
+    TEST_ASSERT(eh_wifi_reconnect_update(h) == STM_OK && mock_requests == before);
+    HAL_Delay(105U);
+    TEST_ASSERT(eh_wifi_reconnect_update(h) == STM_OK && mock_requests == before + 1U);
+    TEST_ASSERT(h->reconnect_attempts == 1U && h->reconnect_delay == 200U);
+    mock_connect_event = 0U;
+    HAL_Delay(65U);
+    TEST_ASSERT(eh_wifi_reconnect_update(h) == STM_OK && h->reconnect_waiting);
+    HAL_Delay(105U);
+    TEST_ASSERT(eh_wifi_reconnect_update(h) == STM_OK && mock_requests == before + 1U);
+    HAL_Delay(105U);
+    TEST_ASSERT(eh_wifi_reconnect_update(h) == STM_OK && mock_requests == before + 2U);
+    TEST_ASSERT(h->reconnect_attempts == 2U && h->reconnect_delay == 400U);
+    mock_connect_event = 0U;
+    HAL_Delay(65U);
+    TEST_ASSERT(eh_wifi_reconnect_update(h) == STM_OK && !h->reconnect_waiting);
+    HAL_Delay(1000U);
+    TEST_ASSERT(eh_wifi_reconnect_update(h) == STM_OK && mock_requests == before + 2U);
+    TEST_ASSERT(eh_wifi_connect(h, 500U) == STM_OK);
+    TEST_ASSERT(esp_hosted_poll(h) == STM_OK && eh_wifi_is_connected(h));
+    TEST_ASSERT(h->reconnect_attempts == 0U && h->reconnect_delay == 100U);
+    mock_disconnect_event = 1U;
+    TEST_ASSERT(esp_hosted_poll(h) == STM_OK && h->reconnect_waiting);
+    TEST_ASSERT(eh_wifi_disconnect(h, 500U) == STM_OK && !h->reconnect_armed);
+    HAL_Delay(1000U);
+    before = mock_requests;
+    TEST_ASSERT(eh_wifi_reconnect_update(h) == STM_OK && mock_requests == before);
+    TEST_ASSERT(eh_wifi_connect(h, 500U) == STM_OK);
+    TEST_ASSERT(eh_wifi_stop(h, 500U) == STM_OK && !h->reconnect_armed);
+    config.enabled = 0U;
+    TEST_ASSERT(eh_wifi_set_reconnect(h, &config) == STM_OK);
+    TEST_ASSERT(eh_wifi_start(h, 500U) == STM_OK);
+    TEST_ASSERT(eh_wifi_connect(h, 500U) == STM_OK && !h->reconnect_armed);
+    mock_connect_event = 0U;
+    test_hal_set_frame_callback(NULL);
+    TEST_ASSERT(esp_hosted_delete(&h) == STM_OK);
+    return 0;
+}
+
 int main(void)
 {
     TEST_ASSERT(test_dummy_transfer() == 0);
@@ -613,6 +688,7 @@ int main(void)
     TEST_ASSERT(test_control_and_sta() == 0);
     TEST_ASSERT(test_init_timeout() == 0);
     TEST_ASSERT(test_successful_rpc_sequence() == 0);
+    TEST_ASSERT(test_reconnect_policy() == 0);
     puts("stm_esp_hosted tests: PASS");
     return 0;
 }

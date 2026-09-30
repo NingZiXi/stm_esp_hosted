@@ -16,11 +16,33 @@ target_link_libraries(my_app PRIVATE stm_esp_hosted_lwip) # 或仅 stm_esp_hoste
 ## 调用顺序
 
 1. CubeMX 初始化 SPI Mode 3、CS/Reset/Handshake/Data Ready GPIO；准备两个 32 字节对齐且 DMA 可访问的 1600 字节缓冲区。调用 `esp_hosted_create()`、`esp_hosted_start(handle, timeout_ms)` 完成 INIT/RPC 协商和 CP 版本检查；`esp_hosted_get_version()` 可查询版本。
-2. 调用 `eh_wifi_init()`、`eh_wifi_set_mode(handle, EH_WIFI_MODE_STA, timeout_ms)`、`eh_wifi_get_mac(handle, EH_WIFI_IF_STA, mac)` 和 `eh_wifi_start()`。用 `eh_wifi_set_config(handle, EH_WIFI_IF_STA, &config, timeout_ms)` 设置 STA 参数，再调用 `eh_wifi_connect()`。连接及扫描是异步过程，通过 `eh_wifi_set_event_callback()` 接收事件，并频繁调用 `esp_hosted_poll()`。`eh_wifi_connect()` 返回成功仅表示请求被接受，关联结果以事件及 `eh_wifi_get_status()` 的 `sta_connected` 为准；此接口返回的模式、启动、STA/AP 链路、扫描中状态和最近断线原因均为缓存快照，不发起 RPC。`eh_wifi_get_mode()` 则使用 RPC 259 读取 CP 的实际模式。断线后可以重新配置并连接。关联后可用 `eh_wifi_sta_get_ap_info()` 查询当前 AP 的 SSID、BSSID、信道、RSSI 和认证方式；未关联时返回状态错误。
+2. 调用 `eh_wifi_init()`、`eh_wifi_set_mode(handle, EH_WIFI_MODE_STA, timeout_ms)`、`eh_wifi_get_mac(handle, EH_WIFI_IF_STA, mac)` 和 `eh_wifi_start()`。用 `eh_wifi_set_config(handle, EH_WIFI_IF_STA, &config, timeout_ms)` 设置 STA 参数，再调用 `eh_wifi_connect()`。连接及扫描是异步过程，通过 `eh_wifi_set_event_callback()` 接收事件，并频繁调用 `esp_hosted_poll()`。`eh_wifi_connect()` 返回成功仅表示请求被接受，关联结果以事件及 `eh_wifi_get_status()` 的 `sta_connected` 为准；此接口返回的模式、启动、STA/AP 链路、扫描中状态和最近断线原因均为缓存快照，不发起 RPC。`eh_wifi_get_mode()` 则使用 RPC 259 读取 CP 的实际模式。应用可选择启用下述自动重连策略；不启用时仍可自行重新连接。关联后可用 `eh_wifi_sta_get_ap_info()` 查询当前 AP 的 SSID、BSSID、信道、RSSI 和认证方式；未关联时返回状态错误。
 3. 若使用 lwIP：先 `lwip_init()`，再以 STA MAC 调用 `esp_hosted_lwip_prepare()`、`netif_add(..., esp_hosted_lwip_netif_init, ethernet_input)`、`netif_set_default()`、`netif_set_up()` 和 `esp_hosted_lwip_attach()`。主循环每次 `esp_hosted_poll()` 后调用 `esp_hosted_lwip_sta_update()`，适配层按链路启停 DHCP，断线时清除旧 IPv4 地址，重连后重新取址；用 `esp_hosted_lwip_sta_has_address()` 判断 DHCP 是否已提供地址。应用继续负责 `lwip_init()`、网卡添加与默认网卡选择，以及 `sys_check_timeouts()`；移除网卡前调用 `esp_hosted_lwip_sta_stop()`。
 4. 可选扫描：`eh_wifi_scan_start(handle, &scan_config, timeout_ms)` 启动，收到 `EH_WIFI_EVENT_SCAN_DONE` 后检查事件中的 `scan_status`（零表示成功），成功时用 `eh_wifi_scan_get_results()` 读取有限容量的记录；超时则调用 `eh_wifi_scan_stop()`，随后可重新扫描。结果包含 SSID、BSSID、信道、RSSI 和认证模式。
 5. 可选 AP：模式设为 `EH_WIFI_MODE_AP` 或 `EH_WIFI_MODE_APSTA`，用 `eh_wifi_get_mac(handle, EH_WIFI_IF_AP, ap_mac)`、`eh_wifi_set_config(handle, EH_WIFI_IF_AP, &ap_config, timeout_ms)` 配置，并调用 `eh_wifi_start()`。如需 IP 通信，使用 `esp_hosted_lwip_ap_prepare()`、`netif_add(..., esp_hosted_lwip_ap_netif_init, ethernet_input)` 和 `esp_hosted_lwip_ap_attach()` 建立 AP netif。应用自行指定 AP 地址、掩码；主循环每次 `esp_hosted_poll()` 后调用 `esp_hosted_lwip_dhcps_update()`，适配层随 AP 链路启停 DHCP 服务。移除网卡前调用 `esp_hosted_lwip_dhcps_stop()`。内置 DHCP 仅为 /24 子网分配 `.100` 至 `.103` 四个地址，适合最小演示，不作为通用 DHCP 服务。
 6. 不用 lwIP 时，`esp_hosted_set_callbacks()` 接收 STA 帧与链路变化、`esp_hosted_send()` 发送 STA Ethernet 帧；AP 对应 `eh_wifi_set_ap_rx_callback()`、`eh_wifi_set_ap_link_callback()` 和 `eh_wifi_ap_send()`。回调在同步轮询/发送路径触发，接收帧指针仅在回调期间有效。使用 lwIP 时释放前停止 DHCP、移除网卡，再调用 `esp_hosted_delete()`。
+
+## STA 自动重连
+
+自动重连默认关闭。完成 `eh_wifi_start()`、设置 STA 配置后，调用 `eh_wifi_set_reconnect()` 启用策略，仍须由应用调用一次 `eh_wifi_connect()` 发起首次连接。之后主循环在 `esp_hosted_poll()` 和 `esp_hosted_lwip_sta_update()` 后调用 `eh_wifi_reconnect_update()`；其到期时会执行同步连接 RPC，因此不要在事件回调内调用。连接请求成功仅表示 CP 已接受请求，STA 关联、DHCP 和上层数据通路需分别确认。
+
+```c
+eh_wifi_reconnect_config_t retry = {
+    .enabled = 1U,
+    .initial_delay_ms = 1000U,
+    .max_delay_ms = 30000U,
+    .association_timeout_ms = 15000U,
+    .rpc_timeout_ms = 5000U,
+    .max_attempts = 0U, /* 0 表示不限次数。 */
+};
+if (eh_wifi_set_reconnect(host, &retry) == STM_OK) {
+    (void)eh_wifi_connect(host, 5000U);
+}
+/* 主循环：esp_hosted_poll(host); esp_hosted_lwip_sta_update(&adapter);
+ * eh_wifi_reconnect_update(host); sys_check_timeouts(); */
+```
+
+连接断开或关联超时后按指数退避尝试，最长等待由 `max_delay_ms` 限制。`max_attempts` 计入自动尝试次数，不计首次显式连接；达到上限后停止自动尝试，显式调用 `eh_wifi_connect()` 可重新开始。`eh_wifi_get_status()` 的 `reconnect_enabled`、`reconnect_pending` 和 `reconnect_attempts` 是本地快照；`last_disconnect_reason` 保留 CP 最近一次断线原因。`eh_wifi_disconnect()`、`eh_wifi_stop()`、退出 STA 模式及禁用策略都会取消自动重连。应用切换网络时应显式断开、更新配置并重新发起连接。退避期间仍需持续轮询和处理 lwIP 定时器。
 
 ## 配置读回与 STA 省电
 
@@ -54,10 +76,12 @@ cmake --build build/stm_esp_hosted_tests
 ctest --test-dir build/stm_esp_hosted_tests --output-on-failure
 ```
 
-测试覆盖帧校验和边界、RPC 异常与超时、扫描错误重试、STA/AP 事件、模式/配置/省电模式读回的成功与异常响应、密码不外露、DHCP 租约分配/续租/冲突/释放，以及轻量 lwIP 仿真中的 `pbuf` 链收发。STM32 实板已验证 STA 获取 DHCP 地址、DNS、TCP/UDP 回显与主动断线重连。此前 CP Wi-Fi init RPC（278）曾因 NVS 未初始化返回 `0x1101`；CP 工程改为先初始化 NVS 和事件循环，再启动 ESP-Hosted。2026-09-28 的阶段性测试中，20 次 J-Link 复位均在 90 秒内完成全链路验证。2026-09-29 的纯 STA 持续运行从首次全链路通过起保持 7200 秒，121 轮 TCP/UDP 周期回显全部通过、0 失败；期间一次主动断线后约 9.9 秒恢复，并重新获得 DHCP 地址及完成 DNS 查询。整板断电重启的独立结果见下文。
+测试覆盖帧校验和边界、RPC 异常与超时、扫描错误重试、STA/AP 事件、模式/配置/省电模式读回的成功与异常响应、密码不外露、DHCP 租约分配/续租/冲突/释放，以及轻量 lwIP 仿真中的 `pbuf` 链收发。本轮新增自动重连的首次连接、关联超时、退避和重试上限、意外断线，以及主动断开、停止和禁用后的取消测试。STM32 实板已验证 STA 获取 DHCP 地址、DNS、TCP/UDP 回显与主动断线重连。此前 CP Wi-Fi init RPC（278）曾因 NVS 未初始化返回 `0x1101`；CP 工程改为先初始化 NVS 和事件循环，再启动 ESP-Hosted。2026-09-28 的阶段性测试中，20 次 J-Link 复位均在 90 秒内完成全链路验证。2026-09-29 的纯 STA 持续运行从首次全链路通过起保持 7200 秒，121 轮 TCP/UDP 周期回显全部通过、0 失败；期间一次主动断线后约 9.9 秒恢复，并重新获得 DHCP 地址及完成 DNS 查询。整板断电重启的独立结果见下文。
 
 AP+STA 实板功能测试中，首次扫描返回 3 条记录，最终固件复测返回 4 条记录，电脑关联测试 AP 后获得 `192.168.40.100/24`，网关 `192.168.40.1`，三次 UDP 数据均从 `192.168.40.1:24681` 原样回显。切换测试电脑的无线网络后，STA 测试服务器不可达，因此该切换后的回显失败不计入持续运行稳定性结论。2026-09-29，手机连接测试 AP 后，在浏览器访问 `http://192.168.40.1/` 成功显示 `STM32 AP OK`；RTT 记录客户端接入和来自 `192.168.40.100` 的两次 HTTP GET。该页面验证单客户端 AP TCP/HTTP 通路。手机向 AP 的 UDP 回显端口发送数据时，每次发送均收到一条对应回包；板端 RTT 连续记录 `AP UDP echo 47 bytes`，47 字节是手机应用实际报文长度，不代表仅发送了五字节文本。此项只验证 AP UDP 双向通信，不计为长期稳定性测试。多个客户端、AP 长期运行、BLE、OTA 和 RTOS 仍未验证或实现。原始日志与本地凭据不随组件发布。
 
 2026-09-29 至 09-30 的 v0.3.0 实板回归：STA 配置与模式查询成功，`NONE`、`MIN_MODEM`、`MAX_MODEM` 各设置及读回成功；每种模式以约 60 秒间隔进行 10 轮 DHCP 地址保持、DNS、TCP/UDP 回显，合计 30/30 轮通过。主动断线后重新取址并恢复 DNS、TCP/UDP。AP+STA 模式及 AP 配置读回成功，板端 DHCP 启动；手机获取租约、访问 HTTP 页面并收到 UDP 回显，板端记录对应客户端、HTTP 和 UDP 事件。此项功能回归与后续整板断电重启分别统计。
+
+2026-09-30 的自动重连实板诊断：使用仅供本地测试的固件让 CP 发出真实 STA 断线事件，保留组件的自动重连策略；在断线后约 11.8 秒重新完成关联、DHCP、DNS 与 TCP/UDP 回显，期间未记录回显失败。诊断入口随后已移除，正式固件重新烧录并在一次复位后通过 CP INIT、STA、DHCP、DNS 与两轮间隔约 60 秒的 TCP/UDP 回显，零失败。此项验证 CP 断线事件的恢复路径，不代表路由器断电或射频持续干扰场景，也不替代此前的整板断电验收。原始日志仅在本地保留。
 
 2026-09-30 的整板断电重启验收共观察 13 次：10 次有效通过，均重新完成 CP 3.0.9 INIT、STA 关联、DHCP、DNS 及 TCP/UDP 回显；其中还观察到一次欠压启动失败、一次采集缺口无法判定、一次无法证明整板重启且网络验证失败。10 次通过并非连续 10 次无故障通过。最后一次有效循环从 ESP 串口断连到首轮全链路通过约 33.5 秒；主动断线后的 DHCP 重新取址、DNS 和 TCP/UDP 回显恢复亦通过。部分循环在 USB 重新枚举期间未采集到 CP ROM 启动文本，因此不据此推断上电瞬态均正常。原始日志和逐次记录仅留在本地构建目录，不随组件发布。

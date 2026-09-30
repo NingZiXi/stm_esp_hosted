@@ -24,6 +24,13 @@ struct esp_hosted_context {
     uint8_t scan_pending;
     uint8_t scan_done;
     uint32_t last_disconnect_reason;
+    eh_wifi_reconnect_config_t reconnect_config;
+    uint32_t reconnect_since;
+    uint32_t reconnect_delay;
+    uint16_t reconnect_attempts;
+    uint8_t reconnect_armed;
+    uint8_t reconnect_waiting;
+    uint8_t connect_pending;
     eh_wifi_event_fn wifi_event;
     void *wifi_event_user;
     eh_wifi_ap_link_fn ap_link;
