@@ -248,6 +248,21 @@ typedef union {
     eh_wifi_sta_config_t sta;
     eh_wifi_ap_config_t ap;
 } eh_wifi_config_t;
+/** Configuration read back from the CP. Credentials are deliberately excluded. */
+typedef struct {
+    char ssid[33];
+    uint8_t channel;         /* AP only. */
+    uint8_t hidden;          /* AP only. */
+    uint8_t max_connections; /* AP only. */
+    uint8_t authmode;        /* AP only; ESP-IDF wifi_auth_mode_t value. */
+} eh_wifi_config_info_t;
+
+typedef enum {
+    EH_WIFI_PS_NONE = 0,
+    EH_WIFI_PS_MIN_MODEM = 1,
+    EH_WIFI_PS_MAX_MODEM = 2,
+} eh_wifi_ps_t;
+
 typedef struct {
     const char *ssid; /* NULL scans all SSIDs. */
     uint8_t channel;  /* 0 scans all channels. */
@@ -294,8 +309,16 @@ typedef void (*eh_wifi_ap_link_fn)(void *user, uint8_t up);
  * asynchronous operations; call esp_hosted_poll() frequently to receive events. */
 stm_err_t eh_wifi_init(esp_hosted_handle_t handle, uint32_t timeout_ms);
 stm_err_t eh_wifi_set_mode(esp_hosted_handle_t handle, eh_wifi_mode_t mode, uint32_t timeout_ms);
+/** Query the CP's actual mode (unlike the cached eh_wifi_get_status snapshot). */
+stm_err_t eh_wifi_get_mode(esp_hosted_handle_t handle, eh_wifi_mode_t *mode, uint32_t timeout_ms);
 stm_err_t eh_wifi_set_config(esp_hosted_handle_t handle, eh_wifi_if_t iface,
                              const eh_wifi_config_t *config, uint32_t timeout_ms);
+/** Query STA/AP configuration, omitting credentials and unsupported advanced fields. */
+stm_err_t eh_wifi_get_config(esp_hosted_handle_t handle, eh_wifi_if_t iface,
+                             eh_wifi_config_info_t *info, uint32_t timeout_ms);
+/** CP power-save mode: no implicit change to its default setting. */
+stm_err_t eh_wifi_set_ps(esp_hosted_handle_t handle, eh_wifi_ps_t mode, uint32_t timeout_ms);
+stm_err_t eh_wifi_get_ps(esp_hosted_handle_t handle, eh_wifi_ps_t *mode, uint32_t timeout_ms);
 stm_err_t eh_wifi_start(esp_hosted_handle_t handle, uint32_t timeout_ms);
 stm_err_t eh_wifi_stop(esp_hosted_handle_t handle, uint32_t timeout_ms);
 stm_err_t eh_wifi_connect(esp_hosted_handle_t handle, uint32_t timeout_ms);

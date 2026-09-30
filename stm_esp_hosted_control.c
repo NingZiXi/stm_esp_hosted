@@ -17,6 +17,13 @@
 /* Internal layout is shared with the transport implementation within this component. */
 #include "stm_esp_hosted_private.h"
 
+/* A volatile write prevents credential-bearing RPC buffers from being optimized away. */
+static void clear_sensitive(void *data, size_t length)
+{
+    volatile uint8_t *p = (volatile uint8_t *)data;
+    while (length--) { *p++ = 0U; }
+}
+
 static size_t put_varint(uint8_t *out, uint64_t value)
 {
     size_t n = 0;
@@ -218,7 +225,13 @@ static stm_err_t consume(struct esp_hosted_context *ctx)
 static stm_err_t exchange(struct esp_hosted_context *ctx, const uint8_t *tx)
 {
     stm_err_t err = esp_hosted_transfer(ctx, tx, NULL);
-    return err == STM_OK ? consume(ctx) : err;
+    if (err != STM_OK) { return err; }
+    err = consume(ctx);
+    /* RPC frames can include Wi-Fi configuration (and its password), even if late. */
+    if ((ctx->config.rx_buffer[0] & 0x0FU) == RPC_IF) {
+        clear_sensitive(ctx->config.rx_buffer, ESP_HOSTED_FRAME_SIZE);
+    }
+    return err;
 }
 stm_err_t esp_hosted_poll(esp_hosted_handle_t handle)
 {
@@ -249,6 +262,7 @@ static stm_err_t request(struct esp_hosted_context *ctx, uint16_t id,
     ctx->info.last_rpc_status = 0U;
     ctx->info.last_rpc_status_present = 0U;
     ctx->response_uid = ++ctx->uid;
+    clear_sensitive(ctx->response_data, sizeof(ctx->response_data));
     ctx->response_length = 0U; ctx->response_ready = 0U;
     n += put_num(rpc + n, 1U, 1U);
     n += put_num(rpc + n, 2U, id);
@@ -263,6 +277,7 @@ static stm_err_t request(struct esp_hosted_context *ctx, uint16_t id,
     memset(wire, 0, sizeof(wire)); memset(rpc, 0, sizeof(rpc));
     if (err == STM_OK) { err = esp_hosted_wait_handshake(ctx, timeout_ms); }
     if (err == STM_OK) { err = exchange(ctx, ctx->config.tx_buffer); }
+    if (id == 284U) { clear_sensitive(ctx->config.tx_buffer, ESP_HOSTED_FRAME_SIZE); }
     uint32_t start = HAL_GetTick();
     while (err == STM_OK && !ctx->response_ready && HAL_GetTick() - start < timeout_ms) {
         err = esp_hosted_poll(ctx);
@@ -285,6 +300,7 @@ static stm_err_t request(struct esp_hosted_context *ctx, uint16_t id,
                    *out_len = ctx->response_length; }
         }
     }
+    clear_sensitive(ctx->response_data, sizeof(ctx->response_data));
     ctx->response_length = 0U; ctx->response_ready = 0U;
     return err;
 }
@@ -378,6 +394,104 @@ stm_err_t eh_wifi_set_mode(esp_hosted_handle_t h, eh_wifi_mode_t mode, uint32_t 
     }
     return err;
 }
+stm_err_t eh_wifi_get_mode(esp_hosted_handle_t h, eh_wifi_mode_t *mode, uint32_t timeout_ms)
+{
+    if (!h || !mode || !timeout_ms) { return STM_ERR_INVALID_ARG; }
+    if (!h->wifi_initialized) { return STM_ERR_INVALID_STATE; }
+    uint8_t response[16] = {0}; size_t len = sizeof(response);
+    stm_err_t err = request(h, 259U, NULL, 0U, response, &len, timeout_ms);
+    if (err == STM_OK) {
+        const uint8_t *unused = NULL; size_t size = 0U; uint64_t value = 0U;
+        /* Proto3 elides NULL (zero); response field 2 was checked by request(). */
+        int present = field(response, len, 1U, 0U, &unused, &size, &value);
+        if (present < 0 || value > EH_WIFI_MODE_APSTA) { err = STM_ERR_VERIFY; }
+        else { *mode = (eh_wifi_mode_t)value; }
+    }
+    clear_sensitive(response, sizeof(response));
+    return err;
+}
+
+stm_err_t eh_wifi_set_ps(esp_hosted_handle_t h, eh_wifi_ps_t mode, uint32_t timeout_ms)
+{
+    if (!h || !timeout_ms || (unsigned)mode > EH_WIFI_PS_MAX_MODEM) { return STM_ERR_INVALID_ARG; }
+    if (!h->wifi_initialized || !(h->wifi_mode & EH_WIFI_MODE_STA)) { return STM_ERR_INVALID_STATE; }
+    uint8_t body[4]; size_t len = put_num(body, 1U, (uint32_t)mode);
+    return request(h, 270U, body, len, NULL, NULL, timeout_ms);
+}
+
+stm_err_t eh_wifi_get_ps(esp_hosted_handle_t h, eh_wifi_ps_t *mode, uint32_t timeout_ms)
+{
+    if (!h || !mode || !timeout_ms) { return STM_ERR_INVALID_ARG; }
+    if (!h->wifi_initialized || !(h->wifi_mode & EH_WIFI_MODE_STA)) { return STM_ERR_INVALID_STATE; }
+    uint8_t response[16] = {0}; size_t len = sizeof(response);
+    stm_err_t err = request(h, 271U, NULL, 0U, response, &len, timeout_ms);
+    if (err == STM_OK) {
+        const uint8_t *unused = NULL; size_t size = 0U; uint64_t value = 0U;
+        int present = field(response, len, 2U, 0U, &unused, &size, &value);
+        if (present < 0 || value > EH_WIFI_PS_MAX_MODEM) { err = STM_ERR_VERIFY; }
+        else { *mode = (eh_wifi_ps_t)value; }
+    }
+    clear_sensitive(response, sizeof(response));
+    return err;
+}
+
+/** Decode only the documented, credential-free subset of wifi_config. */
+static stm_err_t parse_config_info(const uint8_t *response, size_t len, eh_wifi_if_t iface,
+                                   eh_wifi_config_info_t *out)
+{
+    const uint8_t *data = NULL, *cfg = NULL, *entry = NULL;
+    size_t size = 0U, cfg_len = 0U, entry_len = 0U;
+    uint64_t value = 0U;
+    /* Proto3 omits the zero-valued STA interface, but AP must be explicit. */
+    int iface_present = field(response, len, 2U, 0U, &data, &size, &value);
+    if (iface_present < 0 || (iface == EH_WIFI_IF_AP && iface_present != 1) ||
+        value != (uint32_t)iface ||
+        field(response, len, 3U, 2U, &cfg, &cfg_len, &value) != 1 ||
+        field(cfg, cfg_len, iface == EH_WIFI_IF_STA ? 1U : 2U, 2U,
+              &data, &size, &value) != 0 ||
+        field(cfg, cfg_len, iface == EH_WIFI_IF_STA ? 2U : 1U, 2U,
+              &entry, &entry_len, &value) != 1 ||
+        field(entry, entry_len, 1U, 2U, &data, &size, &value) != 1 ||
+        size == 0U || size > 32U) { return STM_ERR_VERIFY; }
+    eh_wifi_config_info_t parsed = {0};
+    memcpy(parsed.ssid, data, size);
+    if (iface == EH_WIFI_IF_AP) {
+        uint64_t number = 0U;
+        if (field(entry, entry_len, 4U, 0U, &data, &size, &number) != 1 ||
+            number == 0U || number > 14U) { return STM_ERR_VERIFY; }
+        parsed.channel = (uint8_t)number; number = 0U;
+        if (field(entry, entry_len, 6U, 0U, &data, &size, &number) < 0 || number > 1U) {
+            return STM_ERR_VERIFY;
+        }
+        parsed.hidden = (uint8_t)number; number = 0U;
+        if (field(entry, entry_len, 7U, 0U, &data, &size, &number) != 1 ||
+            number == 0U || number > UINT8_MAX) { return STM_ERR_VERIFY; }
+        parsed.max_connections = (uint8_t)number; number = 0U;
+        if (field(entry, entry_len, 5U, 0U, &data, &size, &number) < 0 || number > UINT8_MAX) {
+            return STM_ERR_VERIFY;
+        }
+        parsed.authmode = (uint8_t)number;
+    }
+    *out = parsed;
+    return STM_OK;
+}
+
+stm_err_t eh_wifi_get_config(esp_hosted_handle_t h, eh_wifi_if_t iface,
+                             eh_wifi_config_info_t *info, uint32_t timeout_ms)
+{
+    if (!h || !info || !timeout_ms || iface > EH_WIFI_IF_AP) { return STM_ERR_INVALID_ARG; }
+    if (!h->wifi_initialized || !(h->wifi_mode & (iface == EH_WIFI_IF_STA ?
+                                                     EH_WIFI_MODE_STA : EH_WIFI_MODE_AP))) {
+        return STM_ERR_INVALID_STATE;
+    }
+    uint8_t request_body[4]; size_t body_len = put_num(request_body, 1U, (uint32_t)iface);
+    uint8_t response[512] = {0}; size_t len = sizeof(response);
+    stm_err_t err = request(h, 285U, request_body, body_len, response, &len, timeout_ms);
+    if (err == STM_OK) { err = parse_config_info(response, len, iface, info); }
+    clear_sensitive(response, sizeof(response));
+    return err;
+}
+
 stm_err_t eh_wifi_set_config(esp_hosted_handle_t h, eh_wifi_if_t iface,
                              const eh_wifi_config_t *config, uint32_t timeout_ms)
 {
@@ -400,6 +514,8 @@ stm_err_t eh_wifi_set_config(esp_hosted_handle_t h, eh_wifi_if_t iface,
             config->ap.channel > 13U || config->ap.max_connections > 4U) { return STM_ERR_INVALID_CONFIG; }
         n += put_bytes(inner + n, 1U, (const uint8_t *)config->ap.ssid, ssid_len);
         n += put_bytes(inner + n, 2U, (const uint8_t *)config->ap.password, pass_len);
+        /* CP 3.0.9 only includes AP SSID in get_config when ssid_len is nonzero. */
+        n += put_num(inner + n, 3U, ssid_len);
         n += put_num(inner + n, 4U, config->ap.channel ? config->ap.channel : 1U);
         n += put_num(inner + n, 5U, pass_len ? 3U : 0U); /* OPEN or WPA2-PSK */
         n += put_num(inner + n, 6U, config->ap.hidden ? 1U : 0U);

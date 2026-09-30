@@ -283,6 +283,10 @@ static int test_init_timeout(void)
 /* The mock CP replies in the same SPI transaction and emits a later STA event. */
 static esp_hosted_handle_t mock_host;
 static unsigned mock_stage, mock_requests, mock_connect_event, mock_error_mode;
+static unsigned query_fault, mock_mode = EH_WIFI_MODE_STA, mock_ps, mock_iface;
+/* 1=CP error, 2=missing cfg, 3=oversize SSID, 4=wrong iface,
+ * 5=wrong branch, 6=malformed payload, 7=timeout, 8=stale uid,
+ * 9=bad enum. */
 static uint32_t mock_seen;
 static uint64_t test_read_varint(const uint8_t **data)
 {
@@ -358,9 +362,10 @@ static void mock_cp(const uint8_t *tx, uint8_t *rx, uint16_t length)
     uint32_t id = (uint32_t)test_read_varint(&rpc);
     if (*rpc++ != 24U) { return; }
     uint32_t uid = (uint32_t)test_read_varint(&rpc);
-    uint8_t body[96] = {0}, payload[128] = {0}, wire[160] = {0};
+    uint8_t body[512] = {0}, payload[640] = {0}, wire[700] = {0};
     size_t b = 0U, n = 0U, w = 0U;
     ++mock_requests;
+    if (query_fault == 7U && (id == 259U || id == 271U || id == 285U)) { return; }
     if (id == 350U) {
         b += test_put_num(body + b, 2U, 3U);
         /* protobuf omits the zero-valued minor field on the real CP. */
@@ -394,7 +399,12 @@ static void mock_cp(const uint8_t *tx, uint8_t *rx, uint16_t length)
         else { scan_event_pending = 1U; }
     }
     else if (id == 278U) { mock_seen |= 4U; }
-    else if (id == 259U) { mock_seen |= 8U; }
+    else if (id == 259U) {
+        mock_seen |= 8U;
+        if (query_fault == 1U) { b += test_put_num(body + b, 2U, 1U); }
+        else if (query_fault == 9U) { b += test_put_num(body + b, 1U, 4U); }
+        else if (mock_mode) { b += test_put_num(body + b, 1U, mock_mode); }
+    }
     else if (id == 260U) {
         mock_seen |= 16U;
         if (mock_error_mode) { b += test_put_num(body + b, 1U, 1U); }
@@ -403,15 +413,63 @@ static void mock_cp(const uint8_t *tx, uint8_t *rx, uint16_t length)
         mock_seen |= 64U;
         if (mock_error_mode) { b += test_put_num(body + b, 1U, 1U); }
     }
+    else if (id == 270U) {
+        if (query_fault == 1U) { b += test_put_num(body + b, 1U, 1U); }
+        else {
+            const uint8_t *cursor = rpc;
+            (void)test_read_varint(&cursor);
+            (void)test_read_varint(&cursor);
+            if (*cursor++ == 8U) { mock_ps = (unsigned)test_read_varint(&cursor); }
+            else { mock_ps = 0U; }
+        }
+    }
+    else if (id == 271U) {
+        if (query_fault == 1U) { b += test_put_num(body + b, 1U, 1U); }
+        else if (query_fault == 9U) { b += test_put_num(body + b, 2U, 3U); }
+        else if (mock_ps) { b += test_put_num(body + b, 2U, mock_ps); }
+    }
+    else if (id == 285U) {
+        if (query_fault == 1U) { b += test_put_num(body + b, 1U, 1U); }
+        else if (query_fault != 2U) {
+            uint8_t entry[192] = {0}, config[208] = {0}; size_t e = 0U, c = 0U;
+            const uint8_t *cursor = rpc;
+            (void)test_read_varint(&cursor);
+            (void)test_read_varint(&cursor);
+            if (*cursor++ == 8U) { mock_iface = (unsigned)test_read_varint(&cursor); }
+            if (query_fault == 6U) { entry[e++] = 0x0AU; entry[e++] = 0x7FU; }
+            else {
+                uint8_t too_long[33]; memset(too_long, 'X', sizeof(too_long));
+                const char *ssid = mock_iface == EH_WIFI_IF_STA ? "test-network" : "hosted-test";
+                e += test_put_bytes(entry + e, 1U,
+                     query_fault == 3U ? too_long : (const uint8_t *)ssid,
+                     query_fault == 3U ? sizeof(too_long) : strlen(ssid));
+                e += test_put_bytes(entry + e, 2U, (const uint8_t *)"secret-password", 15U);
+                if (mock_iface == EH_WIFI_IF_AP) {
+                    e += test_put_num(entry + e, 4U, 6U);
+                    e += test_put_num(entry + e, 5U, 3U);
+                    e += test_put_num(entry + e, 7U, 4U);
+                }
+            }
+            c += test_put_bytes(config + c,
+                   (mock_iface == EH_WIFI_IF_STA) != (query_fault == 5U) ? 2U : 1U,
+                   entry, e);
+            /* Proto3 omits the zero-valued STA iface in the actual CP response. */
+            if (mock_iface || query_fault == 4U) {
+                b += test_put_num(body + b, 2U,
+                      query_fault == 4U ? 1U - mock_iface : mock_iface);
+            }
+            b += test_put_bytes(body + b, 3U, config, c);
+        }
+    }
     else if (id == 282U) { mock_seen |= 128U; mock_connect_event = 1U; }
     else if (id == 283U) { mock_seen |= 256U; }
     n += test_put_num(payload + n, 1U, 2U);
     n += test_put_num(payload + n, 2U, id + 256U);
-    n += test_put_num(payload + n, 3U, uid);
+    n += test_put_num(payload + n, 3U, query_fault == 8U ? uid - 1U : uid);
     n += test_put_bytes(payload + n, id + 256U, body, b);
     wire[w++] = 1U; wire[w++] = sizeof(ep) - 1U; wire[w++] = 0U;
     memcpy(wire + w, ep, sizeof(ep) - 1U); w += sizeof(ep) - 1U;
-    wire[w++] = 2U; wire[w++] = (uint8_t)n; wire[w++] = 0U;
+    wire[w++] = 2U; wire[w++] = (uint8_t)n; wire[w++] = (uint8_t)(n >> 8U);
     memcpy(wire + w, payload, n); w += n;
     (void)esp_hosted_encode_frame(mock_host, 3U, 0U, 2U, wire, w, rx, length);
 }
@@ -425,7 +483,7 @@ static int test_successful_rpc_sequence(void)
     TEST_ASSERT(h != NULL);
     mock_host = h; mock_stage = mock_requests = mock_connect_event = mock_error_mode = 0U;
     mock_seen = scan_event_pending = scan_config_seen = scan_rejected = 0U;
-    scan_result_status = ap_info_bad = 0U;
+    scan_result_status = ap_info_bad = query_fault = mock_ps = mock_iface = 0U; mock_mode = EH_WIFI_MODE_STA;
     test_hal_set_frame_callback(mock_cp);
     stm_err_t start_result = esp_hosted_start(h, 500U);
     if (start_result != STM_OK) { fprintf(stderr, "start=%ld stage=%u requests=%u seen=%lu\n", (long)start_result, mock_stage, mock_requests, (unsigned long)mock_seen); }
@@ -436,6 +494,29 @@ static int test_successful_rpc_sequence(void)
     TEST_ASSERT(eh_wifi_get_status(h, &snapshot) == STM_OK && !snapshot.started);
     TEST_ASSERT(eh_wifi_init(h, 500U) == STM_OK);
     TEST_ASSERT(eh_wifi_set_mode(h, EH_WIFI_MODE_STA, 500U) == STM_OK);
+    eh_wifi_mode_t actual_mode = EH_WIFI_MODE_NULL;
+    TEST_ASSERT(eh_wifi_get_mode(h, &actual_mode, 500U) == STM_OK && actual_mode == EH_WIFI_MODE_STA);
+    for (unsigned fault = 1U; fault <= 9U; ++fault) {
+        if (fault == 2U || fault == 3U || fault == 4U || fault == 5U || fault == 6U) { continue; }
+        query_fault = fault; actual_mode = EH_WIFI_MODE_AP;
+        stm_err_t expected = fault == 1U ? STM_ERR_IO :
+                             fault == 9U ? STM_ERR_VERIFY : STM_ERR_TIMEOUT;
+        TEST_ASSERT(eh_wifi_get_mode(h, &actual_mode, 5U) == expected &&
+                    actual_mode == EH_WIFI_MODE_AP);
+    }
+    query_fault = 0U;
+    eh_wifi_ps_t ps = EH_WIFI_PS_NONE;
+    for (unsigned mode = 0U; mode < 3U; ++mode) {
+        TEST_ASSERT(eh_wifi_set_ps(h, (eh_wifi_ps_t)mode, 500U) == STM_OK);
+        TEST_ASSERT(eh_wifi_get_ps(h, &ps, 500U) == STM_OK && ps == (eh_wifi_ps_t)mode);
+    }
+    TEST_ASSERT(eh_wifi_set_ps(h, (eh_wifi_ps_t)3U, 500U) == STM_ERR_INVALID_ARG);
+    query_fault = 1U;
+    TEST_ASSERT(eh_wifi_set_ps(h, EH_WIFI_PS_NONE, 500U) == STM_ERR_IO);
+    TEST_ASSERT(eh_wifi_get_ps(h, &ps, 500U) == STM_ERR_IO && ps == EH_WIFI_PS_MAX_MODEM);
+    query_fault = 9U;
+    TEST_ASSERT(eh_wifi_get_ps(h, &ps, 500U) == STM_ERR_VERIFY && ps == EH_WIFI_PS_MAX_MODEM);
+    query_fault = 0U;
     TEST_ASSERT(eh_wifi_get_mac(h, EH_WIFI_IF_STA, mac) == STM_OK);
     TEST_ASSERT(mac[0] == 2U && mac[5] == 0x55U);
     eh_wifi_config_t config = {0};
@@ -445,6 +526,21 @@ static int test_successful_rpc_sequence(void)
     TEST_ASSERT(eh_wifi_set_config(h, EH_WIFI_IF_STA, &config, 500U) == STM_ERR_IO);
     mock_error_mode = 0U;
     TEST_ASSERT(eh_wifi_set_config(h, EH_WIFI_IF_STA, &config, 500U) == STM_OK);
+    eh_wifi_config_info_t info = {0};
+    TEST_ASSERT(eh_wifi_get_config(h, EH_WIFI_IF_STA, &info, 500U) == STM_OK &&
+                !strcmp(info.ssid, "test-network") && info.channel == 0U);
+    TEST_ASSERT(sizeof(info) < 65U);
+    TEST_ASSERT(eh_wifi_get_config(h, (eh_wifi_if_t)2U, &info, 500U) == STM_ERR_INVALID_ARG);
+    for (unsigned fault = 1U; fault <= 8U; ++fault) {
+        query_fault = fault;
+        memset(&info, 0xA5, sizeof(info));
+        stm_err_t expected = fault == 1U ? STM_ERR_IO :
+                             fault >= 7U ? STM_ERR_TIMEOUT : STM_ERR_VERIFY;
+        TEST_ASSERT(eh_wifi_get_config(h, EH_WIFI_IF_STA, &info, 5U) == expected);
+        TEST_ASSERT((unsigned char)info.ssid[0] == 0xA5U);
+    }
+    query_fault = 0U;
+    TEST_ASSERT(eh_wifi_get_config(h, EH_WIFI_IF_STA, &info, 500U) == STM_OK);
     TEST_ASSERT(eh_wifi_start(h, 500U) == STM_OK);
     TEST_ASSERT(eh_wifi_connect(h, 500U) == STM_OK);
     TEST_ASSERT(eh_wifi_get_status(h, &snapshot) == STM_OK && snapshot.started &&
@@ -495,6 +591,9 @@ static int test_successful_rpc_sequence(void)
     strcpy(ap_config.ap.password, "test-password");
     ap_config.ap.channel = 6U;
     TEST_ASSERT(eh_wifi_set_config(h, EH_WIFI_IF_AP, &ap_config, 500U) == STM_OK);
+    TEST_ASSERT(eh_wifi_get_config(h, EH_WIFI_IF_AP, &info, 500U) == STM_OK &&
+                !strcmp(info.ssid, "hosted-test") && info.channel == 6U &&
+                info.authmode == 3U && info.max_connections == 4U);
     TEST_ASSERT(eh_wifi_start(h, 500U) == STM_OK);
     TEST_ASSERT(mock_seen == 511U && mock_requests >= 15U);
     test_hal_set_frame_callback(NULL);
