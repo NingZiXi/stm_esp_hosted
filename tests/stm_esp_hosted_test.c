@@ -284,6 +284,11 @@ static int test_init_timeout(void)
 static esp_hosted_handle_t mock_host;
 static unsigned mock_stage, mock_requests, mock_connect_event, mock_disconnect_event, mock_error_mode;
 static unsigned query_fault, mock_mode = EH_WIFI_MODE_STA, mock_ps, mock_iface;
+/* Runtime queries: CP error, missing value, invalid scalar, duplicate, wrong wire,
+ * corrupt tail, timeout, stale UID, oversized body, valid unknown fields,
+ * invalid second client, inconsistent count, sign-extended int32, default RSSI. */
+static unsigned runtime_fault, runtime_clients = 2U, runtime_second, runtime_primary = 6U;
+static unsigned runtime_request_ok;
 /* 1=CP error, 2=missing cfg, 3=oversize SSID, 4=wrong iface,
  * 5=wrong branch, 6=malformed payload, 7=timeout, 8=stale uid,
  * 9=bad enum. */
@@ -370,9 +375,11 @@ static void mock_cp(const uint8_t *tx, uint8_t *rx, uint16_t length)
     uint32_t id = (uint32_t)test_read_varint(&rpc);
     if (*rpc++ != 24U) { return; }
     uint32_t uid = (uint32_t)test_read_varint(&rpc);
-    uint8_t body[512] = {0}, payload[640] = {0}, wire[700] = {0};
+    uint8_t body[640] = {0}, payload[740] = {0}, wire[800] = {0};
     size_t b = 0U, n = 0U, w = 0U;
     ++mock_requests;
+    if (runtime_fault == 7U && (id == 341U || id == 302U || id == 311U ||
+        id == 312U || id == 293U)) { return; }
     if (query_fault == 7U && (id == 259U || id == 271U || id == 285U)) { return; }
     if (id == 350U) {
         b += test_put_num(body + b, 2U, 3U);
@@ -469,11 +476,78 @@ static void mock_cp(const uint8_t *tx, uint8_t *rx, uint16_t length)
             b += test_put_bytes(body + b, 3U, config, c);
         }
     }
+    else if (id == 341U || id == 302U || id == 311U || id == 312U || id == 293U) {
+        if (runtime_fault == 1U) { b += test_put_num(body + b, 1U, 0x3001U); }
+        else if (id == 341U) {
+            if (runtime_fault != 2U && runtime_fault != 14U) {
+                if (runtime_fault == 5U) { b += test_put_bytes(body + b, 2U, mac, 6U); }
+                else { b += test_put_num(body + b, 2U,
+                    runtime_fault == 3U ? 128U : runtime_fault == 13U ? (uint64_t)(int64_t)-42 : (uint32_t)-42); }
+                if (runtime_fault == 4U) { b += test_put_num(body + b, 2U, 10U); }
+            }
+        } else if (id == 302U) {
+            if (runtime_fault != 2U) {
+                b += test_put_num(body + b, 2U, runtime_primary);
+                if (runtime_second || runtime_fault == 3U) {
+                    b += test_put_num(body + b, 3U, runtime_fault == 3U ? 3U : runtime_second);
+                }
+                if (runtime_fault == 4U) { b += test_put_num(body + b, 2U, 6U); }
+                if (runtime_fault == 5U) { b += test_put_bytes(body + b, 3U, mac, 6U); }
+            }
+        } else if (id == 311U) {
+            if (runtime_fault != 2U) {
+                uint8_t list[256] = {0}; size_t l = 0U;
+                for (unsigned i = 0U; i < runtime_clients; ++i) {
+                    uint8_t entry[64], client[6]; size_t e = 0U;
+                    memcpy(client, mac, 6U); client[5] += (uint8_t)i;
+                    if (runtime_fault == 16U && i == 1U) { client[0] = 1U; }
+                    e += test_put_bytes(entry + e, 1U, client,
+                        runtime_fault == 11U && i == 1U ? 5U : 6U);
+                    if (runtime_fault == 4U) { e += test_put_bytes(entry + e, 1U, client, 6U); }
+                    if (runtime_fault == 5U) { e += test_put_num(entry + e, 1U, 1U); }
+                    if (runtime_fault != 14U) { e += test_put_num(entry + e, 2U,
+                        runtime_fault == 3U ? (uint64_t)(int64_t)-129 :
+                        runtime_fault == 13U ? (uint64_t)(int64_t)-42 : (uint32_t)-42); }
+                    l += test_put_bytes(list + l, 1U, entry, e);
+                }
+                if (runtime_clients || runtime_fault == 12U) {
+                    l += test_put_num(list + l, 2U, runtime_fault == 12U ? runtime_clients + 1U : runtime_clients);
+                }
+                if (runtime_fault == 15U) { l += test_put_num(list + l, 2U, runtime_clients); }
+                if (runtime_fault == 17U) { list[l++] = 0x1DU; list[l++] = 1U; } /* truncated unknown fixed32 */
+                b += test_put_bytes(body + b, 2U, list, l);
+            }
+        } else if (id == 312U) {
+            const uint8_t *cursor = rpc;
+            uint64_t key = test_read_varint(&cursor), body_len = test_read_varint(&cursor);
+            runtime_request_ok = key == (((uint64_t)312U << 3U) | 2U) && body_len == 8U &&
+                cursor[0] == 10U && cursor[1] == 6U && memcmp(cursor + 2U, mac, 6U) == 0;
+            if (runtime_fault != 2U) {
+                b += test_put_num(body + b, 2U, runtime_fault == 3U ? 2008U : 7U);
+                if (runtime_fault == 4U) { b += test_put_num(body + b, 2U, 8U); }
+                if (runtime_fault == 5U) { b += test_put_bytes(body + b, 2U, mac, 6U); }
+            }
+        } else {
+            const uint8_t *cursor = rpc;
+            uint64_t key = test_read_varint(&cursor), body_len = test_read_varint(&cursor);
+            runtime_request_ok = key == (((uint64_t)293U << 3U) | 2U) && body_len == 2U &&
+                cursor[0] == 8U && cursor[1] == 7U;
+            if (runtime_fault == 4U) { b += test_put_num(body + b, 1U, 0U); b += test_put_num(body + b, 1U, 0U); }
+            if (runtime_fault == 5U) { b += test_put_bytes(body + b, 1U, mac, 6U); }
+        }
+        if (runtime_fault == 6U) { body[b++] = 0x80U; }
+        if (runtime_fault == 9U) { uint8_t pad[514] = {0}; b += test_put_bytes(body + b, 20U, pad, sizeof(pad)); }
+        if (runtime_fault == 10U) {
+            body[b++] = 0xA5U; body[b++] = 1U; memset(body + b, 0xAA, 4U); b += 4U;
+            body[b++] = 0xA9U; body[b++] = 1U; memset(body + b, 0xBB, 8U); b += 8U;
+            b += test_put_num(body + b, 22U, 99U);
+        }
+    }
     else if (id == 282U) { mock_seen |= 128U; mock_connect_event = 1U; }
     else if (id == 283U) { mock_seen |= 256U; }
     n += test_put_num(payload + n, 1U, 2U);
     n += test_put_num(payload + n, 2U, id + 256U);
-    n += test_put_num(payload + n, 3U, query_fault == 8U ? uid - 1U : uid);
+    n += test_put_num(payload + n, 3U, query_fault == 8U || runtime_fault == 8U ? uid - 1U : uid);
     n += test_put_bytes(payload + n, id + 256U, body, b);
     wire[w++] = 1U; wire[w++] = sizeof(ep) - 1U; wire[w++] = 0U;
     memcpy(wire + w, ep, sizeof(ep) - 1U); w += sizeof(ep) - 1U;
@@ -676,6 +750,103 @@ static int test_reconnect_policy(void)
     return 0;
 }
 
+static int test_runtime_queries(void)
+{
+    static uint8_t tx[ESP_HOSTED_FRAME_SIZE] __attribute__((aligned(ESP_HOSTED_DMA_ALIGNMENT)));
+    static uint8_t rx[ESP_HOSTED_FRAME_SIZE] __attribute__((aligned(ESP_HOSTED_DMA_ALIGNMENT)));
+    const uint8_t mac[6] = {2,0x11,0x22,0x33,0x44,0x55};
+    esp_hosted_handle_t h = make_handle(tx, rx, ESP_HOSTED_DUMMY_IF_TYPE);
+    TEST_ASSERT(h != NULL);
+    mock_host = h; mock_stage = 1U;
+    mock_connect_event = mock_disconnect_event = scan_event_pending = query_fault = runtime_fault = 0U;
+    test_hal_set_frame_callback(mock_cp);
+    h->negotiated = 1U; h->wifi_started = 1U; h->wifi_mode = EH_WIFI_MODE_APSTA;
+    h->connected = 1U; h->ap_up = 1U;
+    int8_t rssi = 11; uint8_t primary = 99U; uint16_t aid = 99U;
+    eh_wifi_second_chan_t second = EH_WIFI_SECOND_CHAN_BELOW;
+    eh_wifi_sta_record_t records[2], saved[2]; memset(saved, 0xA5, sizeof(saved));
+    size_t count = 99U;
+    TEST_ASSERT(eh_wifi_sta_get_rssi(h, &rssi, 50U) == STM_OK && rssi == -42);
+    for (unsigned i = 0U; i <= 2U; ++i) {
+        runtime_second = i;
+        TEST_ASSERT(eh_wifi_get_channel(h, &primary, &second, 50U) == STM_OK && primary == 6U && (unsigned)second == i);
+    }
+    runtime_second = 0U;
+    TEST_ASSERT(eh_wifi_ap_get_sta_aid(h, mac, &aid, 50U) == STM_OK && aid == 7U && runtime_request_ok);
+    TEST_ASSERT(eh_wifi_deauth_sta(h, 7U, 50U) == STM_OK && runtime_request_ok && h->ap_up);
+    TEST_ASSERT(eh_wifi_ap_get_sta_list(h, NULL, 0U, &count, 50U) == STM_OK && count == 2U);
+    memcpy(records, saved, sizeof(records));
+    TEST_ASSERT(eh_wifi_ap_get_sta_list(h, records, 1U, &count, 50U) == STM_ERR_OUT_OF_RANGE && count == 2U);
+    TEST_ASSERT(memcmp(records, saved, sizeof(records)) == 0);
+    TEST_ASSERT(eh_wifi_ap_get_sta_list(h, records, 2U, &count, 50U) == STM_OK && count == 2U);
+    TEST_ASSERT(memcmp(records[0].mac, mac, 6U) == 0 && records[1].mac[5] == 0x56U && records[1].rssi == -42);
+    runtime_clients = 0U;
+    TEST_ASSERT(eh_wifi_ap_get_sta_list(h, records, 0U, &count, 50U) == STM_OK && count == 0U);
+    runtime_clients = 2U;
+    for (unsigned fault = 1U; fault <= 14U; ++fault) {
+        runtime_fault = fault;
+        stm_err_t expected = fault == 1U ? STM_ERR_IO :
+            (fault == 7U || fault == 8U) ? STM_ERR_TIMEOUT : STM_ERR_VERIFY;
+        int valid_rssi = fault == 2U || fault == 10U || fault == 11U || fault == 12U || fault == 13U || fault == 14U;
+        rssi = 11;
+        TEST_ASSERT(eh_wifi_sta_get_rssi(h, &rssi, 20U) == (valid_rssi ? STM_OK : expected));
+        TEST_ASSERT(rssi == (valid_rssi ? ((fault == 2U || fault == 14U) ? 0 : -42) : 11));
+        int valid_channel = fault >= 10U;
+        primary = 99U; second = EH_WIFI_SECOND_CHAN_BELOW;
+        TEST_ASSERT(eh_wifi_get_channel(h, &primary, &second, 20U) == (valid_channel ? STM_OK : expected));
+        TEST_ASSERT(primary == (valid_channel ? 6U : 99U) && second == (valid_channel ? EH_WIFI_SECOND_CHAN_NONE : EH_WIFI_SECOND_CHAN_BELOW));
+        int valid_list = fault == 10U || fault == 13U || fault == 14U;
+        count = 99U; memcpy(records, saved, sizeof(records));
+        TEST_ASSERT(eh_wifi_ap_get_sta_list(h, records, 2U, &count, 20U) == (valid_list ? STM_OK : expected));
+        TEST_ASSERT(count == (valid_list ? 2U : 99U));
+        if (valid_list) { TEST_ASSERT(records[0].rssi == (fault == 14U ? 0 : -42)); }
+        else { TEST_ASSERT(memcmp(records, saved, sizeof(records)) == 0); }
+        int valid_aid = fault >= 10U;
+        aid = 99U;
+        TEST_ASSERT(eh_wifi_ap_get_sta_aid(h, mac, &aid, 20U) == (valid_aid ? STM_OK : expected));
+        TEST_ASSERT(aid == (valid_aid ? 7U : 99U));
+        int valid_deauth = fault == 2U || fault == 3U || fault >= 10U;
+        TEST_ASSERT(eh_wifi_deauth_sta(h, 7U, 20U) == (valid_deauth ? STM_OK : expected));
+    }
+    runtime_fault = 0U;
+    for (unsigned fault = 15U; fault <= 17U; ++fault) {
+        runtime_fault = fault; count = 99U; memcpy(records, saved, sizeof(records));
+        TEST_ASSERT(eh_wifi_ap_get_sta_list(h, records, 2U, &count, 50U) == STM_ERR_VERIFY);
+        TEST_ASSERT(count == 99U && memcmp(records, saved, sizeof(records)) == 0);
+    }
+    runtime_fault = 0U;
+    /* A stale reply was discarded; a new UID transaction can still complete. */
+    TEST_ASSERT(eh_wifi_sta_get_rssi(h, &rssi, 50U) == STM_OK && rssi == -42);
+    runtime_primary = 0U;
+    TEST_ASSERT(eh_wifi_get_channel(h, &primary, &second, 50U) == STM_ERR_VERIFY);
+    runtime_primary = 15U;
+    TEST_ASSERT(eh_wifi_get_channel(h, &primary, &second, 50U) == STM_ERR_VERIFY);
+    runtime_primary = 6U;
+    unsigned before = mock_requests;
+    TEST_ASSERT(eh_wifi_sta_get_rssi(NULL, &rssi, 50U) == STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_sta_get_rssi(h, NULL, 50U) == STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_get_channel(h, &primary, NULL, 50U) == STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_ap_get_sta_list(h, NULL, 1U, &count, 50U) == STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_ap_get_sta_list(h, records, 2U, NULL, 50U) == STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_ap_get_sta_aid(h, (const uint8_t[6]){0}, &aid, 50U) == STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_ap_get_sta_aid(h, (const uint8_t[6]){1,2,3,4,5,6}, &aid, 50U) == STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_deauth_sta(h, 0U, 50U) == STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_deauth_sta(h, 2008U, 50U) == STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_deauth_sta(h, 7U, 0U) == STM_ERR_INVALID_ARG);
+    h->connected = 0U;
+    TEST_ASSERT(eh_wifi_sta_get_rssi(h, &rssi, 50U) == STM_ERR_INVALID_STATE);
+    h->ap_up = 0U;
+    TEST_ASSERT(eh_wifi_ap_get_sta_list(h, records, 2U, &count, 50U) == STM_ERR_INVALID_STATE);
+    TEST_ASSERT(eh_wifi_ap_get_sta_aid(h, mac, &aid, 50U) == STM_ERR_INVALID_STATE);
+    TEST_ASSERT(eh_wifi_deauth_sta(h, 7U, 50U) == STM_ERR_INVALID_STATE);
+    h->wifi_started = 0U;
+    TEST_ASSERT(eh_wifi_get_channel(h, &primary, &second, 50U) == STM_ERR_INVALID_STATE);
+    TEST_ASSERT(mock_requests == before);
+    test_hal_set_frame_callback(NULL);
+    TEST_ASSERT(esp_hosted_delete(&h) == STM_OK);
+    return 0;
+}
+
 int main(void)
 {
     TEST_ASSERT(test_dummy_transfer() == 0);
@@ -689,6 +860,7 @@ int main(void)
     TEST_ASSERT(test_init_timeout() == 0);
     TEST_ASSERT(test_successful_rpc_sequence() == 0);
     TEST_ASSERT(test_reconnect_policy() == 0);
+    TEST_ASSERT(test_runtime_queries() == 0);
     puts("stm_esp_hosted tests: PASS");
     return 0;
 }

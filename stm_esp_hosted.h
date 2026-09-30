@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define STM_ESP_HOSTED_VERSION       "0.4.0"
+#define STM_ESP_HOSTED_VERSION       "0.5.0"
 #define ESP_HOSTED_FRAME_SIZE        1600U
 #define ESP_HOSTED_FRAME_HEADER_SIZE  12U
 #define ESP_HOSTED_FRAME_CHECKSUM_OFFSET 6U
@@ -233,6 +233,17 @@ typedef enum {
     EH_WIFI_MODE_APSTA = 3,
 } eh_wifi_mode_t;
 typedef enum { EH_WIFI_IF_STA = 0, EH_WIFI_IF_AP = 1 } eh_wifi_if_t;
+/** Secondary-channel position reported by the coprocessor. */
+typedef enum {
+    EH_WIFI_SECOND_CHAN_NONE = 0,
+    EH_WIFI_SECOND_CHAN_ABOVE = 1,
+    EH_WIFI_SECOND_CHAN_BELOW = 2,
+} eh_wifi_second_chan_t;
+/** Associated AP client snapshot; IPv4 addresses belong to the DHCP/lwIP layer. */
+typedef struct {
+    uint8_t mac[6];
+    int8_t rssi;
+} eh_wifi_sta_record_t;
 /** Optional STA reconnect policy. max_attempts=0 means unlimited. */
 typedef struct {
     uint32_t initial_delay_ms;
@@ -346,6 +357,25 @@ stm_err_t eh_wifi_get_status(esp_hosted_handle_t handle, eh_wifi_status_t *statu
 /** Query the currently associated AP; requires a STA connection. */
 stm_err_t eh_wifi_sta_get_ap_info(esp_hosted_handle_t handle, eh_wifi_ap_record_t *record,
                                   uint32_t timeout_ms);
+/** Query STA signal strength in dBm; requires an associated STA.
+ * On failure the output remains unchanged. */
+stm_err_t eh_wifi_sta_get_rssi(esp_hosted_handle_t handle, int8_t *rssi, uint32_t timeout_ms);
+/** Query the current radio channel; requires Wi-Fi to be started.
+ * On failure both outputs remain unchanged. */
+stm_err_t eh_wifi_get_channel(esp_hosted_handle_t handle, uint8_t *primary,
+                             eh_wifi_second_chan_t *second, uint32_t timeout_ms);
+/** Query AP clients. NULL/zero capacity queries count only. Insufficient capacity
+ * returns STM_ERR_OUT_OF_RANGE with required count and leaves records unchanged.
+ * All other failures leave both outputs unchanged. Requires an active AP. */
+stm_err_t eh_wifi_ap_get_sta_list(esp_hosted_handle_t handle, eh_wifi_sta_record_t *records,
+                                 size_t capacity, size_t *count, uint32_t timeout_ms);
+/** Query a client's association ID by its unicast MAC; requires an active AP.
+ * On failure the output remains unchanged. */
+stm_err_t eh_wifi_ap_get_sta_aid(esp_hosted_handle_t handle, const uint8_t mac[6],
+                                uint16_t *aid, uint32_t timeout_ms);
+/** Request disconnection of one AP client (AID 1..2007). Success means accepted;
+ * confirm actual departure through events or a fresh client-list query. */
+stm_err_t eh_wifi_deauth_sta(esp_hosted_handle_t handle, uint16_t aid, uint32_t timeout_ms);
 stm_err_t eh_wifi_scan_start(esp_hosted_handle_t handle,
                              const eh_wifi_scan_config_t *config, uint32_t timeout_ms);
 stm_err_t eh_wifi_scan_stop(esp_hosted_handle_t handle, uint32_t timeout_ms);

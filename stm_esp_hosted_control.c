@@ -54,25 +54,42 @@ static int read_varint(const uint8_t **p, const uint8_t *end, uint64_t *v)
     }
     return 0;
 }
-/* Reject unknown wire types and malformed/truncated fields, including fields after the match. */
+/* Bounded proto3 field iterator. Unknown fixed32/fixed64 fields can be skipped. */
+static int next_field(const uint8_t **p, const uint8_t *end, uint32_t *tag,
+                      uint8_t *wire, const uint8_t **bytes, size_t *size, uint64_t *number)
+{
+    uint64_t key, n;
+    if (*p == end) { return 0; }
+    if (!read_varint(p, end, &key) || !(key >> 3U) || key > UINT32_MAX) { return -1; }
+    *tag = (uint32_t)(key >> 3U); *wire = (uint8_t)(key & 7U);
+    *bytes = NULL; *size = 0U; *number = 0U;
+    if (*wire == 0U) { return read_varint(p, end, number) ? 1 : -1; }
+    if (*wire == 2U) {
+        if (!read_varint(p, end, &n) || n > (uint64_t)(end - *p)) { return -1; }
+        *size = (size_t)n;
+    } else if (*wire == 1U || *wire == 5U) {
+        *size = *wire == 1U ? 8U : 4U;
+        if (*size > (size_t)(end - *p)) { return -1; }
+    } else { return -1; }
+    *bytes = *p; *p += *size;
+    return 1;
+}
+/* Singular fields reject duplicates, wrong wire types and trailing corruption. */
 static int field(const uint8_t *data, size_t len, uint32_t wanted, uint8_t wire,
                  const uint8_t **bytes, size_t *size, uint64_t *number)
 {
     const uint8_t *p = data, *end = data + len;
     int found = 0;
     while (p < end) {
-        uint64_t key, n;
-        if (!read_varint(&p, end, &key) || !(key >> 3U) ||
-            !read_varint(&p, end, &n)) { return -1; }
-        if ((key & 7U) == 0U) {
-            if ((key >> 3U) == wanted && wire == 0U) { *number = n; found = 1; }
-        } else if ((key & 7U) == 2U) {
-            if (n > (uint64_t)(end - p)) { return -1; }
-            if ((key >> 3U) == wanted && wire == 2U) {
-                *bytes = p; *size = (size_t)n; found = 1;
-            }
-            p += (size_t)n;
-        } else { return -1; }
+        uint32_t tag; uint8_t actual_wire; const uint8_t *value;
+        size_t value_size; uint64_t n;
+        if (next_field(&p, end, &tag, &actual_wire, &value, &value_size, &n) < 0) { return -1; }
+        if (tag == wanted) {
+            if (found || actual_wire != wire) { return -1; }
+            if (wire == 0U) { *number = n; }
+            else { *bytes = value; *size = value_size; }
+            found = 1;
+        }
     }
     return found;
 }
@@ -772,6 +789,137 @@ stm_err_t eh_wifi_sta_get_ap_info(esp_hosted_handle_t h, eh_wifi_ap_record_t *re
     const uint8_t *raw = NULL; size_t raw_len = 0U; uint64_t unused = 0U;
     if (field(response, len, 2U, 2U, &raw, &raw_len, &unused) != 1) { return STM_ERR_VERIFY; }
     return parse_ap_record(raw, raw_len, record);
+}
+/* Accept protobuf int32's sign-extended encoding and its 32-bit representation. */
+static int decode_rssi(uint64_t raw, int8_t *rssi)
+{
+    int64_t value;
+    if (raw <= INT32_MAX) { value = (int64_t)raw; }
+    else if (raw <= UINT32_MAX) { value = (int64_t)raw - ((int64_t)UINT32_MAX + 1); }
+    else if (raw >= UINT64_MAX - INT32_MAX) { value = -(int64_t)(UINT64_MAX - raw) - 1; }
+    else { return 0; }
+    if (value < INT8_MIN || value > INT8_MAX) { return 0; }
+    *rssi = (int8_t)value;
+    return 1;
+}
+static int valid_client_mac(const uint8_t mac[6])
+{
+    static const uint8_t zero[6] = {0};
+    return !(mac[0] & 1U) && memcmp(mac, zero, sizeof(zero)) != 0;
+}
+static int ap_active(esp_hosted_handle_t h)
+{
+    return h->wifi_started && (h->wifi_mode & EH_WIFI_MODE_AP) && h->ap_up;
+}
+stm_err_t eh_wifi_sta_get_rssi(esp_hosted_handle_t h, int8_t *rssi, uint32_t timeout_ms)
+{
+    if (!h || !rssi || !timeout_ms) { return STM_ERR_INVALID_ARG; }
+    if (!h->wifi_started || !(h->wifi_mode & EH_WIFI_MODE_STA) || !h->connected) {
+        return STM_ERR_INVALID_STATE;
+    }
+    uint8_t response[512]; size_t len = sizeof(response);
+    stm_err_t err = request(h, 341U, NULL, 0U, response, &len, timeout_ms);
+    if (err != STM_OK) { return err; }
+    const uint8_t *bytes = NULL; size_t size = 0U; uint64_t raw = 0U;
+    int8_t parsed;
+    if (field(response, len, 2U, 0U, &bytes, &size, &raw) < 0 ||
+        !decode_rssi(raw, &parsed)) { return STM_ERR_VERIFY; }
+    *rssi = parsed;
+    return STM_OK;
+}
+stm_err_t eh_wifi_get_channel(esp_hosted_handle_t h, uint8_t *primary,
+                             eh_wifi_second_chan_t *second, uint32_t timeout_ms)
+{
+    if (!h || !primary || !second || !timeout_ms) { return STM_ERR_INVALID_ARG; }
+    if (!h->wifi_started) { return STM_ERR_INVALID_STATE; }
+    uint8_t response[512]; size_t len = sizeof(response);
+    stm_err_t err = request(h, 302U, NULL, 0U, response, &len, timeout_ms);
+    if (err != STM_OK) { return err; }
+    const uint8_t *bytes = NULL; size_t size = 0U; uint64_t channel = 0U, secondary = 0U;
+    if (field(response, len, 2U, 0U, &bytes, &size, &channel) < 0 || channel < 1U || channel > 14U ||
+        field(response, len, 3U, 0U, &bytes, &size, &secondary) < 0 ||
+        secondary > EH_WIFI_SECOND_CHAN_BELOW) { return STM_ERR_VERIFY; }
+    *primary = (uint8_t)channel; *second = (eh_wifi_second_chan_t)secondary;
+    return STM_OK;
+}
+static stm_err_t parse_sta_record(const uint8_t *raw, size_t len, eh_wifi_sta_record_t *record)
+{
+    const uint8_t *mac = NULL; size_t mac_len = 0U; uint64_t rssi = 0U;
+    eh_wifi_sta_record_t parsed = {0};
+    if (field(raw, len, 1U, 2U, &mac, &mac_len, &rssi) != 1 || mac_len != 6U ||
+        !valid_client_mac(mac)) { return STM_ERR_VERIFY; }
+    memcpy(parsed.mac, mac, sizeof(parsed.mac));
+    rssi = 0U;
+    if (field(raw, len, 2U, 0U, &mac, &mac_len, &rssi) < 0 ||
+        !decode_rssi(rssi, &parsed.rssi)) { return STM_ERR_VERIFY; }
+    /* Validate the known protocol bitmask, though it is not exposed by this API. */
+    uint64_t bitmask = 0U;
+    if (field(raw, len, 3U, 0U, &mac, &mac_len, &bitmask) < 0 || bitmask > UINT32_MAX) {
+        return STM_ERR_VERIFY;
+    }
+    *record = parsed;
+    return STM_OK;
+}
+stm_err_t eh_wifi_ap_get_sta_list(esp_hosted_handle_t h, eh_wifi_sta_record_t *records,
+                                 size_t capacity, size_t *count, uint32_t timeout_ms)
+{
+    if (!h || !count || !timeout_ms || (!records && capacity)) { return STM_ERR_INVALID_ARG; }
+    if (!ap_active(h)) { return STM_ERR_INVALID_STATE; }
+    uint8_t response[512]; size_t len = sizeof(response);
+    stm_err_t err = request(h, 311U, NULL, 0U, response, &len, timeout_ms);
+    if (err != STM_OK) { return err; }
+    const uint8_t *list = NULL; size_t list_len = 0U; uint64_t declared = 0U;
+    if (field(response, len, 2U, 2U, &list, &list_len, &declared) != 1) { return STM_ERR_VERIFY; }
+    const uint8_t *unused = NULL; size_t unused_len = 0U;
+    if (field(list, list_len, 2U, 0U, &unused, &unused_len, &declared) < 0 || declared > INT32_MAX) {
+        return STM_ERR_VERIFY;
+    }
+    /* Validate every entry before writing anything to the caller's array. */
+    const uint8_t *p = list, *end = list + list_len;
+    size_t total = 0U;
+    while (p < end) {
+        uint32_t tag; uint8_t wire; const uint8_t *raw; size_t size; uint64_t value;
+        if (next_field(&p, end, &tag, &wire, &raw, &size, &value) < 0) { return STM_ERR_VERIFY; }
+        if (tag == 1U) {
+            eh_wifi_sta_record_t parsed;
+            if (wire != 2U || parse_sta_record(raw, size, &parsed) != STM_OK) { return STM_ERR_VERIFY; }
+            ++total;
+        }
+    }
+    if (declared != total) { return STM_ERR_VERIFY; }
+    if (!records && !capacity) { *count = total; return STM_OK; }
+    if (capacity < total) { *count = total; return STM_ERR_OUT_OF_RANGE; }
+    p = list; size_t index = 0U;
+    while (p < end) {
+        uint32_t tag; uint8_t wire; const uint8_t *raw; size_t size; uint64_t value;
+        (void)next_field(&p, end, &tag, &wire, &raw, &size, &value);
+        if (tag == 1U) { (void)parse_sta_record(raw, size, &records[index++]); }
+    }
+    *count = total;
+    return STM_OK;
+}
+stm_err_t eh_wifi_ap_get_sta_aid(esp_hosted_handle_t h, const uint8_t mac[6],
+                                uint16_t *aid, uint32_t timeout_ms)
+{
+    if (!h || !mac || !aid || !timeout_ms || !valid_client_mac(mac)) { return STM_ERR_INVALID_ARG; }
+    if (!ap_active(h)) { return STM_ERR_INVALID_STATE; }
+    uint8_t body[8], response[512]; size_t len = sizeof(response);
+    size_t n = put_bytes(body, 1U, mac, 6U);
+    stm_err_t err = request(h, 312U, body, n, response, &len, timeout_ms);
+    if (err != STM_OK) { return err; }
+    const uint8_t *bytes = NULL; size_t size = 0U; uint64_t parsed = 0U;
+    if (field(response, len, 2U, 0U, &bytes, &size, &parsed) < 0 || parsed < 1U || parsed > 2007U) {
+        return STM_ERR_VERIFY;
+    }
+    *aid = (uint16_t)parsed;
+    return STM_OK;
+}
+stm_err_t eh_wifi_deauth_sta(esp_hosted_handle_t h, uint16_t aid, uint32_t timeout_ms)
+{
+    if (!h || !timeout_ms || aid < 1U || aid > 2007U) { return STM_ERR_INVALID_ARG; }
+    if (!ap_active(h)) { return STM_ERR_INVALID_STATE; }
+    uint8_t body[4]; size_t n = put_num(body, 1U, aid);
+    return request(h, 293U, body, n, NULL, NULL, timeout_ms);
 }
 stm_err_t eh_wifi_scan_stop(esp_hosted_handle_t h, uint32_t timeout_ms)
 {

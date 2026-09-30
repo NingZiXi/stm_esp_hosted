@@ -38,23 +38,34 @@ int main(void)
     n.state=&a; n.input=input;
     CHECK(esp_hosted_lwip_netif_init(&n)==ERR_OK);
     CHECK(n.hwaddr_len==6 && memcmp(n.hwaddr,mac,6)==0 && n.mtu==1500);
+    /* Cached-down state must clear a stale-up netif on attach. */
+    netif_set_link_up(&n);
     CHECK(esp_hosted_lwip_attach(&a)==STM_OK);
+    CHECK(!netif_is_link_up(&n));
     CHECK(esp_hosted_lwip_ap_prepare(&a,&ap,mac)==STM_OK);
     ap.state=&a; ap.input=input;
     CHECK(esp_hosted_lwip_ap_netif_init(&ap)==ERR_OK);
     CHECK(ap.hwaddr_len==6 && memcmp(ap.hwaddr,mac,6)==0 && ap.mtu==1500);
+    netif_set_link_up(&ap);
     CHECK(esp_hosted_lwip_ap_attach(&a)==STM_OK);
+    CHECK(!netif_is_link_up(&ap));
+    /* Reproduce AP_START and STA association before callbacks are attached. */
+    CHECK(esp_hosted_set_callbacks(h,NULL,NULL,NULL)==STM_OK);
+    CHECK(eh_wifi_set_ap_rx_callback(h,NULL,NULL)==STM_OK);
+    CHECK(eh_wifi_set_ap_link_callback(h,NULL,NULL)==STM_OK);
     h->wifi_mode=EH_WIFI_MODE_APSTA; h->wifi_started=1;
     /* CP Wi-Fi AP start (event 773, WIFI_EVENT_AP_START=12). */
     const uint8_t ap_up[]={1,0,0,2,10,0,8,3,16,0x85,6,0xAA,0x30,2,16,12};
     CHECK(esp_hosted_encode_frame(h,3,0,1,ap_up,sizeof(ap_up),frame,sizeof(frame))==STM_OK);
     test_hal_inject_rx(frame,sizeof(frame));
-    CHECK(esp_hosted_poll(h)==STM_OK && netif_is_link_up(&ap));
+    CHECK(esp_hosted_poll(h)==STM_OK && h->ap_up && !netif_is_link_up(&ap));
+    CHECK(esp_hosted_lwip_ap_attach(&a)==STM_OK && netif_is_link_up(&ap));
     /* RPC event 775: host STA link up. */
     const uint8_t event[]={1,0,0,2,10,0,8,3,16,0x87,6,0xBA,0x30,2,0x12,0};
     CHECK(esp_hosted_encode_frame(h,3,0,1,event,sizeof(event),frame,sizeof(frame))==STM_OK);
     test_hal_inject_rx(frame,sizeof(frame));
-    CHECK(esp_hosted_poll(h)==STM_OK && netif_is_link_up(&n));
+    CHECK(esp_hosted_poll(h)==STM_OK && !netif_is_link_up(&n));
+    CHECK(esp_hosted_lwip_attach(&a)==STM_OK && netif_is_link_up(&n));
     CHECK(esp_hosted_lwip_sta_update(&a)==STM_OK && a.dhcp_running && mock_dhcp_starts==1);
     CHECK(esp_hosted_lwip_sta_update(&a)==STM_OK && mock_dhcp_starts==1);
     CHECK(!esp_hosted_lwip_sta_has_address(&a));

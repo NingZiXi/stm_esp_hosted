@@ -53,7 +53,12 @@ err_t esp_hosted_lwip_netif_init(struct netif *netif)
 stm_err_t esp_hosted_lwip_attach(esp_hosted_lwip_t *a)
 {
     if (!a || !a->hosted || !a->netif || a->netif->state != a) { return STM_ERR_INVALID_ARG; }
-    return esp_hosted_set_callbacks(a->hosted, sta_receive, sta_link, a);
+    eh_wifi_status_t status;
+    stm_err_t err = eh_wifi_get_status(a->hosted, &status);
+    if (err == STM_OK) { err = esp_hosted_set_callbacks(a->hosted, sta_receive, sta_link, a); }
+    /* Association may have completed before the netif was attached. */
+    if (err == STM_OK) { sta_link(a, status.sta_connected); }
+    return err;
 }
 
 stm_err_t esp_hosted_lwip_sta_stop(esp_hosted_lwip_t *a)
@@ -130,7 +135,11 @@ err_t esp_hosted_lwip_ap_netif_init(struct netif *netif)
 stm_err_t esp_hosted_lwip_ap_attach(esp_hosted_lwip_t *a)
 {
     if (!a || !a->hosted || !a->ap_netif || a->ap_netif->state != a) { return STM_ERR_INVALID_ARG; }
-    stm_err_t err = eh_wifi_set_ap_rx_callback(a->hosted, ap_receive, a);
+    eh_wifi_status_t status;
+    stm_err_t err = eh_wifi_get_status(a->hosted, &status);
+    if (err == STM_OK) { err = eh_wifi_set_ap_rx_callback(a->hosted, ap_receive, a); }
     if (err == STM_OK) { err = eh_wifi_set_ap_link_callback(a->hosted, ap_link, a); }
+    /* AP_START can arrive while startup RPCs are still being processed. */
+    if (err == STM_OK) { ap_link(a, status.ap_started); }
     return err;
 }

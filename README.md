@@ -66,6 +66,34 @@ if (eh_wifi_get_mode(host, &mode, 5000U) == STM_OK && mode == EH_WIFI_MODE_STA &
 
 凭据存放在应用的本地忽略配置中，不要写入组件源码、公开仓库或日志。STA/AP 一帧最长 1514 字节；短于 Ethernet 头部或超过上限的帧会被拒绝。当前 API 不支持并发调用，也不要在组件回调内重入发送或控制 API。AP 演示已通过单客户端 HTTP/TCP 和手机 UDP 回显；多个客户端并发和长期运行尚未覆盖。
 
+## 运行信息与 AP 客户端管理
+
+`eh_wifi_sta_get_rssi()` 在 STA 已关联时查询 dBm 信号强度；`eh_wifi_get_channel()` 在 Wi-Fi 启动后查询实际主信道及 `EH_WIFI_SECOND_CHAN_NONE/ABOVE/BELOW`。AP+STA 共用射频，AP 信道可能随 STA 关联变化。
+
+AP 已启动后，`eh_wifi_ap_get_sta_list()` 返回一次客户端快照，每条记录包含六字节 MAC 和 RSSI。`records=NULL, capacity=0` 可只查询所需数量；容量不足返回 `STM_ERR_OUT_OF_RANGE` 并更新所需数量，数组保持不变。空列表返回成功及零数量，其他失败保持数组和数量不变。客户端 IP 仍由 DHCP/lwIP 管理，列表不返回 IP 或 AID。
+
+```c
+eh_wifi_sta_record_t clients[4];
+size_t count = 0U;
+stm_err_t err = eh_wifi_ap_get_sta_list(host, clients, 4U, &count, 5000U);
+if (err == STM_OK) {
+    /* 根据应用明确选择的 MAC 查找客户端，再查询 AID。不要自动断开任意客户端。 */
+    for (size_t i = 0U; i < count; ++i) {
+        if (memcmp(clients[i].mac, selected_mac, 6U) == 0) {
+            uint16_t aid;
+            if (eh_wifi_ap_get_sta_aid(host, selected_mac, &aid, 5000U) == STM_OK) {
+                (void)eh_wifi_deauth_sta(host, aid, 5000U);
+            }
+            break;
+        }
+    }
+}
+```
+
+示例需包含 `<string.h>`，`selected_mac` 由应用选择。`eh_wifi_ap_get_sta_aid()` 单独查询关联 ID；`eh_wifi_deauth_sta()` 仅接受 `1..2007`，拒绝零以避免断开全部客户端。成功表示 CP 接受请求，实际离线须通过客户端事件及新的列表确认；客户端也可能马上重新接入，事件发生顺序需分别处理。除列表容量不足时更新数量外，上述查询失败均保持输出不变。同步 RPC 都带 `timeout_ms`，应在主循环执行，事件回调只标记待处理任务。
+
+STA/AP lwIP attach 会同步组件已经缓存的链路状态，随后由事件继续更新。因此，关联或 `AP_START` 早于网卡注册时也能正确启动 DHCP。应用仍需每轮调用对应的生命周期更新及 `sys_check_timeouts()`。
+
 ## 板级参考与验证
 
 STM32H723 板级示例位于配套 `stm_h723_demo` 工程的 `main/app_main.c`。ESP32-C3 的参考固件工程位于本仓库 `firmware/esp32c3_cp/`。该板连接 SPI1 MOSI=PD7、MISO=PA6、SCLK=PG11、CS=PC4、Handshake=PA2、Data Ready=PA3、Reset/EN=PC5；ESP32-C3 对应 GPIO7/2/6/10/3/4。其他板请核对原理图并更换配置。
@@ -85,3 +113,9 @@ AP+STA 实板功能测试中，首次扫描返回 3 条记录，最终固件复�
 2026-09-30 的自动重连实板诊断：使用仅供本地测试的固件让 CP 发出真实 STA 断线事件，保留组件的自动重连策略；在断线后约 11.8 秒重新完成关联、DHCP、DNS 与 TCP/UDP 回显，期间未记录回显失败。诊断入口随后已移除，正式固件重新烧录并在一次复位后通过 CP INIT、STA、DHCP、DNS 与两轮间隔约 60 秒的 TCP/UDP 回显，零失败。此项验证 CP 断线事件的恢复路径，不代表路由器断电或射频持续干扰场景，也不替代此前的整板断电验收。原始日志仅在本地保留。
 
 2026-09-30 的整板断电重启验收共观察 13 次：10 次有效通过，均重新完成 CP 3.0.9 INIT、STA 关联、DHCP、DNS 及 TCP/UDP 回显；其中还观察到一次欠压启动失败、一次采集缺口无法判定、一次无法证明整板重启且网络验证失败。10 次通过并非连续 10 次无故障通过。最后一次有效循环从 ESP 串口断连到首轮全链路通过约 33.5 秒；主动断线后的 DHCP 重新取址、DNS 和 TCP/UDP 回显恢复亦通过。部分循环在 USB 重新枚举期间未采集到 CP ROM 启动文本，因此不据此推断上电瞬态均正常。原始日志和逐次记录仅留在本地构建目录，不随组件发布。
+
+## v0.5.0 验证范围
+
+STM32H723 与 ESP32-C3 CP 3.0.9 完成运行 RSSI、实际信道和关联 AP 信息查询；STA 十轮约 60 秒间隔的 DHCP 地址保持、真实 DNS 与 TCP/UDP 回显通过，零失败。单台手机完成三轮指定 AID 主动断开与重新接入，每轮确认离线事件、列表移除、事件/RPC AID 一致、有效 DHCP 租约、HTTP 访问和 UDP 原样回复；三轮通信恢复均在 90 秒内，AP 测试期间 STA 通信保持正常。多客户端列表及指定客户端操作由模拟测试覆盖，未进行第二台客户端实板隔离验证。
+
+模拟测试新增负 RSSI、信道枚举、列表数量/容量/空列表、多客户端、非法 MAC/AID、CP 错误、重复/畸形/超长响应、超时和迟到响应，以及 attach 前事件和过期网卡链路状态回归。组件测试、STM32 构建、聚合仓库相关编译与 CP 固件构建通过。本轮为功能验收，不增加断电或长期稳定性结论；原始日志、逐次实验记录和凭据仅保留本地。
