@@ -128,7 +128,7 @@ stm_err_t esp_hosted_delete(esp_hosted_handle_t *handle)
     }
     if (*handle != NULL) {
         if ((*handle)->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-        if ((*handle)->request_active || (*handle)->recovery_phase) { return STM_ERR_INVALID_STATE; }
+        if ((*handle)->request_active || (*handle)->recovery_phase || (*handle)->async_owned) { return STM_ERR_INVALID_STATE; }
         free(*handle);
         *handle = NULL;
     }

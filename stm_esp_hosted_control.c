@@ -18,6 +18,9 @@
 #include "stm_esp_hosted_private.h"
 
 /* A volatile write prevents credential-bearing RPC buffers from being optimized away. */
+static stm_err_t async_step(struct esp_hosted_context *ctx);
+static stm_err_t service_frames(struct esp_hosted_context *ctx, uint32_t remaining);
+
 static void clear_sensitive(void *data, size_t length)
 {
     volatile uint8_t *p = (volatile uint8_t *)data;
@@ -127,6 +130,29 @@ static void reconnect_schedule(struct esp_hosted_context *ctx)
     ctx->reconnect_since = HAL_GetTick();
     if (!ctx->reconnect_delay) { ctx->reconnect_delay = ctx->reconnect_config.initial_delay_ms; }
 }
+static void clear_link_frames(struct esp_hosted_context *ctx, uint8_t iface)
+{
+    /* At most two slots: preserve the other interface's FIFO order. */
+    uint8_t original = ctx->queued_count, kept = 0U;
+    for (uint8_t k = 0U; k < original; ++k) {
+        uint8_t source = (ctx->queued_head + k) % 2U;
+        if (ctx->queued_iface[source] == iface) {
+            esp_hosted_count(&ctx->diagnostics.tx_cleared);
+            clear_sensitive(ctx->queued_frame[source], sizeof(ctx->queued_frame[0]));
+        } else {
+            uint8_t dest = (ctx->queued_head + kept++) % 2U;
+            if (dest != source) {
+                memcpy(ctx->queued_frame[dest], ctx->queued_frame[source], sizeof(ctx->queued_frame[0]));
+                ctx->queued_iface[dest] = ctx->queued_iface[source];
+                ctx->queued_length[dest] = ctx->queued_length[source];
+                ctx->queued_tick[dest] = ctx->queued_tick[source];
+                ctx->queued_timeout[dest] = ctx->queued_timeout[source];
+                clear_sensitive(ctx->queued_frame[source], sizeof(ctx->queued_frame[0]));
+            }
+        }
+    }
+    ctx->queued_count = kept; ctx->diagnostics.tx_queue_depth = kept;
+}
 static void link_change(struct esp_hosted_context *ctx, uint8_t connected)
 {
     if (ctx->connected != connected) {
@@ -135,7 +161,10 @@ static void link_change(struct esp_hosted_context *ctx, uint8_t connected)
             ctx->reconnect_waiting = ctx->connect_pending = 0U;
             ctx->reconnect_attempts = 0U;
             ctx->reconnect_delay = ctx->reconnect_config.initial_delay_ms;
-        } else if (ctx->reconnect_armed) { reconnect_schedule(ctx); }
+        } else {
+            clear_link_frames(ctx, ESP_HOSTED_STA_IF_TYPE);
+            if (ctx->reconnect_armed) { reconnect_schedule(ctx); }
+        }
         if (ctx->link) { ++ctx->callback_depth; ctx->link(ctx->user, connected); --ctx->callback_depth; }
     }
 }
@@ -143,6 +172,7 @@ static void ap_link_change(struct esp_hosted_context *ctx, uint8_t up)
 {
     if (ctx->ap_up != up) {
         ctx->ap_up = up;
+        if (!up) { clear_link_frames(ctx, ESP_HOSTED_AP_IF_TYPE); }
         if (ctx->ap_link) { ++ctx->callback_depth; ctx->ap_link(ctx->ap_link_user, up); --ctx->callback_depth; }
     }
 }
@@ -156,6 +186,17 @@ void esp_hosted_invalidate(struct esp_hosted_context *ctx, esp_hosted_fault_t re
     ++ctx->session_epoch;
     esp_hosted_count(&ctx->diagnostics.generation);
     ctx->diagnostics.state = state;
+    if (ctx->async_owned) {
+        ctx->async_done = 1U; ctx->async_error = STM_ERR_CANCELLED;
+        clear_sensitive(&ctx->async_result, sizeof(ctx->async_result));
+        clear_sensitive(&ctx->async_request, sizeof(ctx->async_request));
+    }
+    while (ctx->queued_count) {
+        esp_hosted_count(&ctx->diagnostics.tx_cleared);
+        --ctx->queued_count;
+    }
+    ctx->diagnostics.tx_queue_depth = 0U;
+    clear_sensitive(ctx->request_frame, sizeof(ctx->request_frame));
     esp_hosted_record_fault(ctx, reason, error);
     ctx->initialized = ctx->negotiated = ctx->info.ready = 0U;
     ctx->wifi_initialized = ctx->wifi_started = ctx->wifi_mode = 0U;
@@ -396,7 +437,7 @@ static stm_err_t request_begin(struct esp_hosted_context *ctx, uint16_t id,
     wire[w++] = 2U; wire[w++] = (uint8_t)n; wire[w++] = (uint8_t)(n >> 8U);
     memcpy(wire + w, rpc, n); w += n;
     stm_err_t err = esp_hosted_encode_frame(ctx, RPC_IF, 0U, ++ctx->sequence, wire, w,
-                                             ctx->config.tx_buffer, ESP_HOSTED_FRAME_SIZE);
+                                             ctx->request_frame, ESP_HOSTED_FRAME_SIZE);
     clear_sensitive(wire, sizeof(wire)); clear_sensitive(rpc, sizeof(rpc));
     if (err == STM_OK) { ctx->request_active = 1U; }
     return err;
@@ -405,6 +446,8 @@ static stm_err_t bounded_exchange(struct esp_hosted_context *ctx, const uint8_t 
                                    uint32_t remaining)
 {
     uint32_t saved = ctx->config.transfer_timeout_ms;
+    uint32_t budget = ctx->config.poll_transfer_timeout_ms;
+    if (budget && remaining > budget) { remaining = budget; }
     if (saved > remaining) { ctx->config.transfer_timeout_ms = remaining; }
     stm_err_t err = exchange(ctx, tx);
     ctx->config.transfer_timeout_ms = saved;
@@ -420,14 +463,14 @@ static stm_err_t request_step(struct esp_hosted_context *ctx)
     if (!ctx->request_sent) {
         if (HAL_GPIO_ReadPin(ctx->config.handshake_port, ctx->config.handshake_pin) == GPIO_PIN_SET) {
             ctx->request_sent = 1U;
-            err = bounded_exchange(ctx, ctx->config.tx_buffer, ctx->request_timeout - elapsed);
-            if (ctx->request_id == 284U) { clear_sensitive(ctx->config.tx_buffer, ESP_HOSTED_FRAME_SIZE); }
+            err = bounded_exchange(ctx, ctx->request_frame, ctx->request_timeout - elapsed);
+            if (ctx->request_id == 284U) { clear_sensitive(ctx->request_frame, sizeof(ctx->request_frame)); clear_sensitive(ctx->config.tx_buffer, ESP_HOSTED_FRAME_SIZE); }
         }
     } else {
         esp_hosted_signals_t signals;
         esp_hosted_get_signals(ctx, &signals);
-        if (signals.handshake == GPIO_PIN_SET && signals.data_ready == GPIO_PIN_SET) {
-            err = bounded_exchange(ctx, NULL, ctx->request_timeout - elapsed);
+        if (signals.handshake == GPIO_PIN_SET) {
+            err = service_frames(ctx, ctx->request_timeout - elapsed);
         }
     }
     monitor_update(ctx);
@@ -467,7 +510,8 @@ static stm_err_t request_finish(struct esp_hosted_context *ctx, stm_err_t err,
     clear_sensitive(ctx->response_data, sizeof(ctx->response_data));
     ctx->response_length = 0U; ctx->response_ready = 0U;
     ctx->request_active = ctx->request_sent = 0U;
-    if (ctx->request_id == 284U) { clear_sensitive(ctx->config.tx_buffer, ESP_HOSTED_FRAME_SIZE); }
+    clear_sensitive(ctx->request_frame, sizeof(ctx->request_frame));
+    if (ctx->request_id == 284U) { clear_sensitive(ctx->request_frame, sizeof(ctx->request_frame)); clear_sensitive(ctx->config.tx_buffer, ESP_HOSTED_FRAME_SIZE); }
     return err;
 }
 static stm_err_t request(struct esp_hosted_context *ctx, uint16_t id,
@@ -475,7 +519,19 @@ static stm_err_t request(struct esp_hosted_context *ctx, uint16_t id,
                          uint8_t *out, size_t *out_len, uint32_t timeout_ms)
 {
     if (ctx->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (ctx->recovery_phase || ctx->diagnostics.state == ESP_HOSTED_STATE_FAULT) { return STM_ERR_INVALID_STATE; }
+    if (ctx->async_internal && ctx->async_preparing) {
+        stm_err_t err = request_begin(ctx, id, body, body_len, timeout_ms);
+        return err == STM_OK ? STM_ERR_CANCELLED : err;
+    }
+    if (ctx->async_internal && ctx->async_parsing) {
+        if (out && out_len) {
+            if (*out_len < ctx->async_parse_length) { return STM_ERR_OUT_OF_RANGE; }
+            memcpy(out, ctx->async_parse_data, ctx->async_parse_length);
+            *out_len = ctx->async_parse_length;
+        }
+        return STM_OK;
+    }
+    if (ctx->recovery_phase || (ctx->async_owned && !ctx->async_internal) || ctx->diagnostics.state == ESP_HOSTED_STATE_FAULT) { return STM_ERR_INVALID_STATE; }
     stm_err_t err = request_begin(ctx, id, body, body_len, timeout_ms);
     if (err != STM_OK) { return err; }
     while (err == STM_OK && !ctx->response_ready) { err = request_step(ctx); }
@@ -530,7 +586,7 @@ stm_err_t esp_hosted_recover_begin(esp_hosted_handle_t h, uint32_t timeout_ms)
 {
     if (!h || !timeout_ms || timeout_ms > INT32_MAX) { return STM_ERR_INVALID_ARG; }
     if (h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h->recovery_phase || h->request_active) { return STM_ERR_INVALID_STATE; }
+    if (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal)) { return STM_ERR_INVALID_STATE; }
     esp_hosted_fault_t cause = h->diagnostics.last_fault;
     uint32_t cause_tick = h->diagnostics.last_fault_tick;
     stm_err_t cause_error = h->diagnostics.last_error;
@@ -569,6 +625,8 @@ static stm_err_t recovery_step(struct esp_hosted_context *h)
         if (now - h->phase_tick >= 100U) { h->recovery_phase = 3U; }
     } else if (h->recovery_phase == 3U) {
         uint32_t saved = h->config.transfer_timeout_ms;
+        uint32_t budget = h->config.poll_transfer_timeout_ms;
+        if (budget && remaining > budget) { remaining = budget; }
         if (saved > remaining) { h->config.transfer_timeout_ms = remaining; }
         err = poll_frame(h); h->config.transfer_timeout_ms = saved;
         if (h->negotiated) { h->recovery_phase = 4U; }
@@ -606,19 +664,9 @@ stm_err_t esp_hosted_poll(esp_hosted_handle_t h)
     if (!h) { return STM_ERR_INVALID_ARG; }
     if (h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
     if (h->recovery_phase) { return recovery_step(h); }
+    if (h->async_owned && !h->async_done) { return async_step(h); }
     if (h->request_active) { return STM_ERR_INVALID_STATE; }
-    if (h->queued_count && h->diagnostics.state == ESP_HOSTED_STATE_READY &&
-        HAL_GPIO_ReadPin(h->config.handshake_port, h->config.handshake_pin) == GPIO_PIN_SET) {
-        uint8_t index = h->queued_head;
-        uint8_t frame[ESP_HOSTED_STA_MTU + 14U];
-        size_t length = h->queued_length[index];
-        memcpy(frame, h->queued_frame[index], length);
-        h->queued_head = (index + 1U) % 2U; --h->queued_count;
-        stm_err_t err = h->queued_iface[index] == ESP_HOSTED_STA_IF_TYPE ?
-            esp_hosted_send(h, frame, length) : eh_wifi_ap_send(h, frame, length);
-        monitor_update(h); return err;
-    }
-    stm_err_t err = poll_frame(h);
+    stm_err_t err = service_frames(h, UINT32_MAX);
     monitor_update(h);
     return err;
 }
@@ -639,11 +687,8 @@ static stm_err_t queue_frame(struct esp_hosted_context *h, uint8_t iface,
                               const uint8_t *frame, size_t length)
 {
     if (!h->rx_callback) { return STM_ERR_INVALID_CONTEXT; }
-    if (h->queued_count == 2U) { return STM_ERR_NO_MEM; }
-    uint8_t index = (h->queued_head + h->queued_count) % 2U;
-    memcpy(h->queued_frame[index], frame, length);
-    h->queued_length[index] = (uint16_t)length; h->queued_iface[index] = iface;
-    ++h->queued_count; return STM_OK;
+    return iface == ESP_HOSTED_STA_IF_TYPE ? esp_hosted_send_enqueue(h, frame, length, 1000U) :
+                                             eh_wifi_ap_send_enqueue(h, frame, length, 1000U);
 }
 stm_err_t esp_hosted_send(esp_hosted_handle_t h, const uint8_t *frame, size_t length)
 {
@@ -653,7 +698,7 @@ stm_err_t esp_hosted_send(esp_hosted_handle_t h, const uint8_t *frame, size_t le
     }
     if (!h->initialized || !h->connected) { return STM_ERR_INVALID_STATE; }
     if (h->callback_depth) { return queue_frame(h, ESP_HOSTED_STA_IF_TYPE, frame, length); }
-    if (h->recovery_phase || h->request_active) { return STM_ERR_INVALID_STATE; }
+    if (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal)) { return STM_ERR_INVALID_STATE; }
     stm_err_t err = esp_hosted_encode_frame(h, ESP_HOSTED_STA_IF_TYPE, 0U,
                                              ++h->sequence, frame, length,
                                              h->config.tx_buffer, ESP_HOSTED_FRAME_SIZE);
@@ -671,7 +716,7 @@ static size_t bounded_string(const char *s, size_t max)
 stm_err_t eh_wifi_init(esp_hosted_handle_t h, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     if (!h->initialized) { return STM_ERR_INVALID_STATE; }
@@ -684,8 +729,13 @@ stm_err_t eh_wifi_init(esp_hosted_handle_t h, uint32_t timeout_ms)
     n += put_num(cfg + n, 15U, 752U); n += put_num(cfg + n, 16U, 32U);
     n += put_num(cfg + n, 20U, 0x1F2F3F4FU);
     size_t len = put_bytes(body, 1U, cfg, n);
+    uint32_t started = HAL_GetTick();
     stm_err_t err = request(h, 278U, body, len, NULL, NULL, timeout_ms);
-    if (err == STM_OK) { err = request(h, 259U, NULL, 0U, NULL, NULL, timeout_ms); }
+    if (err == STM_OK) {
+        uint32_t elapsed = HAL_GetTick() - started;
+        err = elapsed >= timeout_ms ? STM_ERR_TIMEOUT :
+            request(h, 259U, NULL, 0U, NULL, NULL, timeout_ms - elapsed);
+    }
     memset(cfg, 0, sizeof(cfg)); memset(body, 0, sizeof(body));
     if (err == STM_OK) { h->wifi_initialized = 1U; }
     return err;
@@ -693,7 +743,7 @@ stm_err_t eh_wifi_init(esp_hosted_handle_t h, uint32_t timeout_ms)
 stm_err_t eh_wifi_set_mode(esp_hosted_handle_t h, eh_wifi_mode_t mode, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !timeout_ms || mode > EH_WIFI_MODE_APSTA) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_initialized) { return STM_ERR_INVALID_STATE; }
@@ -709,7 +759,7 @@ stm_err_t eh_wifi_set_mode(esp_hosted_handle_t h, eh_wifi_mode_t mode, uint32_t 
 stm_err_t eh_wifi_get_mode(esp_hosted_handle_t h, eh_wifi_mode_t *mode, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !mode || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_initialized) { return STM_ERR_INVALID_STATE; }
@@ -729,7 +779,7 @@ stm_err_t eh_wifi_get_mode(esp_hosted_handle_t h, eh_wifi_mode_t *mode, uint32_t
 stm_err_t eh_wifi_set_ps(esp_hosted_handle_t h, eh_wifi_ps_t mode, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !timeout_ms || (unsigned)mode > EH_WIFI_PS_MAX_MODEM) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_initialized || !(h->wifi_mode & EH_WIFI_MODE_STA)) { return STM_ERR_INVALID_STATE; }
@@ -740,7 +790,7 @@ stm_err_t eh_wifi_set_ps(esp_hosted_handle_t h, eh_wifi_ps_t mode, uint32_t time
 stm_err_t eh_wifi_get_ps(esp_hosted_handle_t h, eh_wifi_ps_t *mode, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !mode || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_initialized || !(h->wifi_mode & EH_WIFI_MODE_STA)) { return STM_ERR_INVALID_STATE; }
@@ -793,7 +843,7 @@ stm_err_t eh_wifi_set_protocol(esp_hosted_handle_t h, eh_wifi_if_t iface,
                               uint8_t bitmap, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !radio_iface_valid(iface) || !timeout_ms || !protocol_valid(bitmap)) {
         return STM_ERR_INVALID_ARG;
@@ -805,7 +855,7 @@ stm_err_t eh_wifi_get_protocol(esp_hosted_handle_t h, eh_wifi_if_t iface,
                               uint8_t *bitmap, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !radio_iface_valid(iface) || !bitmap || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     if (!radio_iface_enabled(h, iface)) { return STM_ERR_INVALID_STATE; }
@@ -820,7 +870,7 @@ stm_err_t eh_wifi_set_bandwidth(esp_hosted_handle_t h, eh_wifi_if_t iface,
                                eh_wifi_bandwidth_t bandwidth, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !radio_iface_valid(iface) || !timeout_ms ||
         (bandwidth != EH_WIFI_BW_HT20 && bandwidth != EH_WIFI_BW_HT40)) {
@@ -833,7 +883,7 @@ stm_err_t eh_wifi_get_bandwidth(esp_hosted_handle_t h, eh_wifi_if_t iface,
                                eh_wifi_bandwidth_t *bandwidth, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !radio_iface_valid(iface) || !bandwidth || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     if (!radio_iface_enabled(h, iface)) { return STM_ERR_INVALID_STATE; }
@@ -890,7 +940,7 @@ stm_err_t eh_wifi_get_config(esp_hosted_handle_t h, eh_wifi_if_t iface,
                              eh_wifi_config_info_t *info, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !info || !timeout_ms || iface > EH_WIFI_IF_AP) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_initialized || !(h->wifi_mode & (iface == EH_WIFI_IF_STA ?
@@ -909,7 +959,7 @@ stm_err_t eh_wifi_set_config(esp_hosted_handle_t h, eh_wifi_if_t iface,
                              const eh_wifi_config_t *config, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !config || !timeout_ms || iface > EH_WIFI_IF_AP) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_initialized || h->wifi_mode == EH_WIFI_MODE_NULL ||
@@ -947,7 +997,7 @@ stm_err_t eh_wifi_set_config(esp_hosted_handle_t h, eh_wifi_if_t iface,
 stm_err_t eh_wifi_start(esp_hosted_handle_t h, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_initialized || !h->wifi_mode) { return STM_ERR_INVALID_STATE; }
@@ -959,7 +1009,7 @@ stm_err_t eh_wifi_start(esp_hosted_handle_t h, uint32_t timeout_ms)
 stm_err_t eh_wifi_stop(esp_hosted_handle_t h, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_started) { return STM_ERR_INVALID_STATE; }
@@ -972,17 +1022,20 @@ stm_err_t eh_wifi_stop(esp_hosted_handle_t h, uint32_t timeout_ms)
 stm_err_t eh_wifi_connect(esp_hosted_handle_t h, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_started || !(h->wifi_mode & EH_WIFI_MODE_STA)) { return STM_ERR_INVALID_STATE; }
     uint32_t epoch = h->session_epoch;
     stm_err_t err = request(h, 282U, NULL, 0U, NULL, NULL, timeout_ms);
+    if (h->async_preparing) { return err; }
     /* An INIT/heartbeat fault inside request() must stay fully invalidated. */
     if (h->session_epoch != epoch) { return err; }
     h->reconnect_armed = h->reconnect_config.enabled;
-    h->reconnect_attempts = 0U;
-    h->reconnect_delay = h->reconnect_config.initial_delay_ms;
+    if (!h->async_reconnect) {
+        h->reconnect_attempts = 0U;
+        h->reconnect_delay = h->reconnect_config.initial_delay_ms;
+    }
     h->reconnect_waiting = h->connect_pending = 0U;
     if (err == STM_OK && !h->connected) {
         h->connect_pending = 1U;
@@ -993,7 +1046,7 @@ stm_err_t eh_wifi_connect(esp_hosted_handle_t h, uint32_t timeout_ms)
 stm_err_t eh_wifi_disconnect(esp_hosted_handle_t h, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_started || !(h->wifi_mode & EH_WIFI_MODE_STA)) { return STM_ERR_INVALID_STATE; }
@@ -1007,7 +1060,7 @@ stm_err_t eh_wifi_set_reconnect(esp_hosted_handle_t h,
                                 const eh_wifi_reconnect_config_t *config)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !config || (config->enabled != 0U && config->enabled != 1U)) {
         return STM_ERR_INVALID_ARG;
@@ -1028,7 +1081,7 @@ stm_err_t eh_wifi_set_reconnect(esp_hosted_handle_t h,
 stm_err_t eh_wifi_reconnect_update(esp_hosted_handle_t h)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h) { return STM_ERR_INVALID_ARG; }
     if (!h->reconnect_config.enabled || !h->reconnect_armed || !h->wifi_started ||
@@ -1075,7 +1128,7 @@ stm_err_t eh_wifi_get_status(esp_hosted_handle_t h, eh_wifi_status_t *status)
 stm_err_t eh_wifi_set_event_callback(esp_hosted_handle_t h, eh_wifi_event_fn callback, void *user)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h) { return STM_ERR_INVALID_ARG; }
     h->wifi_event = callback; h->wifi_event_user = user; return STM_OK;
@@ -1083,7 +1136,7 @@ stm_err_t eh_wifi_set_event_callback(esp_hosted_handle_t h, eh_wifi_event_fn cal
 stm_err_t eh_wifi_set_ap_rx_callback(esp_hosted_handle_t h, eh_wifi_ap_rx_fn callback, void *user)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h) { return STM_ERR_INVALID_ARG; }
     h->ap_receive = callback; h->ap_user = user; return STM_OK;
@@ -1091,7 +1144,7 @@ stm_err_t eh_wifi_set_ap_rx_callback(esp_hosted_handle_t h, eh_wifi_ap_rx_fn cal
 stm_err_t eh_wifi_set_ap_link_callback(esp_hosted_handle_t h, eh_wifi_ap_link_fn callback, void *user)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h) { return STM_ERR_INVALID_ARG; }
     h->ap_link = callback; h->ap_link_user = user; return STM_OK;
@@ -1099,7 +1152,7 @@ stm_err_t eh_wifi_set_ap_link_callback(esp_hosted_handle_t h, eh_wifi_ap_link_fn
 stm_err_t eh_wifi_get_mac(esp_hosted_handle_t h, eh_wifi_if_t iface, uint8_t mac[6])
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !mac || iface > EH_WIFI_IF_AP) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_initialized) { return STM_ERR_INVALID_STATE; }
@@ -1119,7 +1172,7 @@ stm_err_t eh_wifi_ap_send(esp_hosted_handle_t h, const uint8_t *frame, size_t le
     if (!h || !frame || length < 14U || length > ESP_HOSTED_STA_MTU + 14U) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_started || !(h->wifi_mode & EH_WIFI_MODE_AP)) { return STM_ERR_INVALID_STATE; }
     if (h->callback_depth) { return queue_frame(h, ESP_HOSTED_AP_IF_TYPE, frame, length); }
-    if (h->recovery_phase || h->request_active) { return STM_ERR_INVALID_STATE; }
+    if (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal)) { return STM_ERR_INVALID_STATE; }
     stm_err_t err = esp_hosted_encode_frame(h, ESP_HOSTED_AP_IF_TYPE, 0U, ++h->sequence,
                                              frame, length, h->config.tx_buffer, ESP_HOSTED_FRAME_SIZE);
     if (err == STM_OK) { err = esp_hosted_wait_handshake(h, 1000U); }
@@ -1130,7 +1183,7 @@ stm_err_t eh_wifi_scan_start(esp_hosted_handle_t h,
                              const eh_wifi_scan_config_t *config, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_started || !(h->wifi_mode & EH_WIFI_MODE_STA) || h->scan_pending) {
@@ -1188,7 +1241,7 @@ stm_err_t eh_wifi_sta_get_ap_info(esp_hosted_handle_t h, eh_wifi_ap_record_t *re
                                   uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !record || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_started || !(h->wifi_mode & EH_WIFI_MODE_STA) || !h->connected) {
@@ -1226,7 +1279,7 @@ static stm_err_t config_ready(esp_hosted_handle_t h, uint32_t timeout_ms, uint8_
 {
     if (!h || !timeout_ms || timeout_ms > INT32_MAX) { return STM_ERR_INVALID_ARG; }
     if (h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (!h->initialized || !h->wifi_initialized || h->recovery_phase || h->request_active ||
+    if (!h->initialized || !h->wifi_initialized || h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal) ||
         (started && !h->wifi_started)) { return STM_ERR_INVALID_STATE; }
     return STM_OK;
 }
@@ -1336,7 +1389,7 @@ stm_err_t eh_wifi_get_max_tx_power(esp_hosted_handle_t h, int8_t *power, uint32_
 stm_err_t eh_wifi_sta_get_rssi(esp_hosted_handle_t h, int8_t *rssi, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !rssi || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_started || !(h->wifi_mode & EH_WIFI_MODE_STA) || !h->connected) {
@@ -1356,7 +1409,7 @@ stm_err_t eh_wifi_get_channel(esp_hosted_handle_t h, uint8_t *primary,
                              eh_wifi_second_chan_t *second, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !primary || !second || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_started) { return STM_ERR_INVALID_STATE; }
@@ -1392,7 +1445,7 @@ stm_err_t eh_wifi_ap_get_sta_list(esp_hosted_handle_t h, eh_wifi_sta_record_t *r
                                  size_t capacity, size_t *count, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !count || !timeout_ms || (!records && capacity)) { return STM_ERR_INVALID_ARG; }
     if (!ap_active(h)) { return STM_ERR_INVALID_STATE; }
@@ -1433,7 +1486,7 @@ stm_err_t eh_wifi_ap_get_sta_aid(esp_hosted_handle_t h, const uint8_t mac[6],
                                 uint16_t *aid, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !mac || !aid || !timeout_ms || !valid_client_mac(mac)) { return STM_ERR_INVALID_ARG; }
     if (!ap_active(h)) { return STM_ERR_INVALID_STATE; }
@@ -1451,7 +1504,7 @@ stm_err_t eh_wifi_ap_get_sta_aid(esp_hosted_handle_t h, const uint8_t mac[6],
 stm_err_t eh_wifi_deauth_sta(esp_hosted_handle_t h, uint16_t aid, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !timeout_ms || aid < 1U || aid > 2007U) { return STM_ERR_INVALID_ARG; }
     if (!ap_active(h)) { return STM_ERR_INVALID_STATE; }
@@ -1461,7 +1514,7 @@ stm_err_t eh_wifi_deauth_sta(esp_hosted_handle_t h, uint16_t aid, uint32_t timeo
 stm_err_t eh_wifi_scan_stop(esp_hosted_handle_t h, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !timeout_ms) { return STM_ERR_INVALID_ARG; }
     if (!h->wifi_started || !(h->wifi_mode & EH_WIFI_MODE_STA) || !h->scan_pending) {
@@ -1475,7 +1528,7 @@ stm_err_t eh_wifi_scan_get_results(esp_hosted_handle_t h, eh_wifi_ap_record_t *r
                                    size_t capacity, size_t *count, uint32_t timeout_ms)
 {
     if (h && h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
-    if (h && (h->recovery_phase || h->request_active)) { return STM_ERR_INVALID_STATE; }
+    if (h && (h->recovery_phase || h->request_active || (h->async_owned && !h->async_internal))) { return STM_ERR_INVALID_STATE; }
 
     if (!h || !count || !timeout_ms || (capacity && !records)) { return STM_ERR_INVALID_ARG; }
     *count = 0U;
@@ -1501,4 +1554,251 @@ stm_err_t eh_wifi_scan_get_results(esp_hosted_handle_t h, eh_wifi_ap_record_t *r
     }
     h->scan_done = 0U;
     return STM_OK;
+}
+
+
+/* All async operations use the existing validators, codecs and output parsers.
+ * Preparation intercepts request() before I/O; parsing supplies the already
+ * validated response. Neither dispatch phase can wait for a CP response. */
+static stm_err_t async_dispatch(struct esp_hosted_context *h, uint32_t timeout)
+{
+    eh_wifi_async_request_t *q = &h->async_request;
+    esp_hosted_async_result_t *r = &h->async_result;
+    if (h->async_monitor) { return esp_hosted_set_monitor(h, &h->async_monitor_config, timeout); }
+    switch (q->op) {
+    case EH_WIFI_ASYNC_INIT: return eh_wifi_init(h, timeout);
+    case EH_WIFI_ASYNC_SET_MODE: return eh_wifi_set_mode(h, q->value.mode, timeout);
+    case EH_WIFI_ASYNC_GET_MODE: return eh_wifi_get_mode(h, &r->mode, timeout);
+    case EH_WIFI_ASYNC_SET_CONFIG:
+        return h->async_parsing ? STM_OK : eh_wifi_set_config(h, q->iface, &q->value.config, timeout);
+    case EH_WIFI_ASYNC_GET_CONFIG: return eh_wifi_get_config(h, q->iface, &r->config, timeout);
+    case EH_WIFI_ASYNC_GET_MAC: return eh_wifi_get_mac(h, q->iface, r->mac);
+    case EH_WIFI_ASYNC_START: return eh_wifi_start(h, timeout);
+    case EH_WIFI_ASYNC_STOP: return eh_wifi_stop(h, timeout);
+    case EH_WIFI_ASYNC_CONNECT: return eh_wifi_connect(h, timeout);
+    case EH_WIFI_ASYNC_DISCONNECT: return eh_wifi_disconnect(h, timeout);
+    case EH_WIFI_ASYNC_SET_PROTOCOL: return eh_wifi_set_protocol(h, q->iface, q->value.protocol, timeout);
+    case EH_WIFI_ASYNC_GET_PROTOCOL: return eh_wifi_get_protocol(h, q->iface, &r->protocol, timeout);
+    case EH_WIFI_ASYNC_SET_BANDWIDTH: return eh_wifi_set_bandwidth(h, q->iface, q->value.bandwidth, timeout);
+    case EH_WIFI_ASYNC_GET_BANDWIDTH: return eh_wifi_get_bandwidth(h, q->iface, &r->bandwidth, timeout);
+    case EH_WIFI_ASYNC_SET_COUNTRY_CODE:
+        return eh_wifi_set_country_code(h, q->value.country.code, q->value.country.ieee80211d_enabled, timeout);
+    case EH_WIFI_ASYNC_GET_COUNTRY_CODE: return eh_wifi_get_country_code(h, r->country_code, timeout);
+    case EH_WIFI_ASYNC_GET_COUNTRY: return eh_wifi_get_country(h, &r->country, timeout);
+    case EH_WIFI_ASYNC_SET_PS: return eh_wifi_set_ps(h, q->value.ps, timeout);
+    case EH_WIFI_ASYNC_GET_PS: return eh_wifi_get_ps(h, &r->ps, timeout);
+    case EH_WIFI_ASYNC_SET_MAX_TX_POWER: return eh_wifi_set_max_tx_power(h, q->value.power, timeout);
+    case EH_WIFI_ASYNC_GET_MAX_TX_POWER: return eh_wifi_get_max_tx_power(h, &r->power, timeout);
+    case EH_WIFI_ASYNC_GET_RSSI: return eh_wifi_sta_get_rssi(h, &r->rssi, timeout);
+    case EH_WIFI_ASYNC_GET_CHANNEL: return eh_wifi_get_channel(h, &r->channel.primary, &r->channel.second, timeout);
+    case EH_WIFI_ASYNC_GET_AP_INFO: return eh_wifi_sta_get_ap_info(h, &r->ap, timeout);
+    default: return STM_ERR_INVALID_ARG;
+    }
+}
+static void async_complete(struct esp_hosted_context *h, stm_err_t error)
+{
+    h->async_done = 1U; h->async_error = error;
+    clear_sensitive(&h->async_request, sizeof(h->async_request));
+    if (error != STM_OK) { clear_sensitive(&h->async_result, sizeof(h->async_result)); }
+}
+static stm_err_t async_submit(struct esp_hosted_context *h, uint32_t timeout,
+                               esp_hosted_async_token_t *token)
+{
+    h->async_internal = h->async_preparing = 1U;
+    stm_err_t e = async_dispatch(h, timeout);
+    h->async_internal = h->async_preparing = 0U;
+    /* CANCELLED is the internal "encoded, not executed" preparation outcome. */
+    if (e != STM_OK && !(e == STM_ERR_CANCELLED && h->request_active)) {
+        clear_sensitive(&h->async_request, sizeof(h->async_request));
+        return e;
+    }
+    h->async_owned = 1U; h->async_done = 0U; h->async_error = STM_OK;
+    h->async_tick = HAL_GetTick(); h->async_timeout = timeout;
+    h->async_token = ++h->async_counter; h->async_stage = 0U;
+    if (h->request_active) {
+        h->request_tick = h->async_tick; h->request_timeout = timeout;
+    } else { async_complete(h, STM_OK); }
+    if (!h->async_monitor && h->async_request.op == EH_WIFI_ASYNC_SET_CONFIG) {
+        clear_sensitive(&h->async_request.value.config, sizeof(h->async_request.value.config));
+    }
+    *token = h->async_token;
+    return STM_OK;
+}
+static stm_err_t async_available(struct esp_hosted_context *h, uint32_t timeout,
+                                 esp_hosted_async_token_t *token)
+{
+    if (!h || !token || !timeout || timeout > INT32_MAX) { return STM_ERR_INVALID_ARG; }
+    if (h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
+    if (h->async_owned || h->request_active || h->recovery_phase || !h->initialized) {
+        return STM_ERR_INVALID_STATE;
+    }
+    return h->async_counter == UINT32_MAX ? STM_ERR_OUT_OF_RANGE : STM_OK;
+}
+stm_err_t eh_wifi_async_begin(esp_hosted_handle_t h, const eh_wifi_async_request_t *request,
+                              uint32_t timeout, esp_hosted_async_token_t *token)
+{
+    if (!request || (unsigned)request->op > EH_WIFI_ASYNC_GET_AP_INFO) { return STM_ERR_INVALID_ARG; }
+    stm_err_t e = async_available(h, timeout, token);
+    if (e != STM_OK) { return e; }
+    h->async_monitor = h->async_reconnect = 0U;
+    if ((request->op == EH_WIFI_ASYNC_SET_MODE && (unsigned)request->value.mode > EH_WIFI_MODE_APSTA) ||
+        ((request->op == EH_WIFI_ASYNC_SET_CONFIG || request->op == EH_WIFI_ASYNC_GET_CONFIG ||
+          request->op == EH_WIFI_ASYNC_GET_MAC) && (unsigned)request->iface > EH_WIFI_IF_AP)) {
+        return STM_ERR_INVALID_ARG;
+    }
+    h->async_request = *request;
+    memset(&h->async_result, 0, sizeof(h->async_result));
+    return async_submit(h, timeout, token);
+}
+stm_err_t esp_hosted_monitor_begin(esp_hosted_handle_t h, const esp_hosted_monitor_config_t *config,
+                                   uint32_t timeout, esp_hosted_async_token_t *token)
+{
+    if (!config) { return STM_ERR_INVALID_ARG; }
+    stm_err_t e = async_available(h, timeout, token);
+    if (e != STM_OK) { return e; }
+    h->async_monitor = 1U; h->async_reconnect = 0U;
+    h->async_monitor_config = *config;
+    memset(&h->async_request, 0, sizeof(h->async_request));
+    memset(&h->async_result, 0, sizeof(h->async_result));
+    return async_submit(h, timeout, token);
+}
+stm_err_t esp_hosted_async_get_status(esp_hosted_handle_t h, esp_hosted_async_token_t token,
+                                      esp_hosted_async_status_t *status)
+{
+    if (!h || !status || !token) { return STM_ERR_INVALID_ARG; }
+    if (!h->async_owned || token != h->async_token) { return STM_ERR_INVALID_STATE; }
+    *status = (esp_hosted_async_status_t){h->async_done ? ESP_HOSTED_ASYNC_DONE : ESP_HOSTED_ASYNC_PENDING,
+                                        h->async_done ? h->async_error : STM_OK};
+    return STM_OK;
+}
+stm_err_t esp_hosted_async_take_result(esp_hosted_handle_t h, esp_hosted_async_token_t token,
+                                       esp_hosted_async_result_t *result)
+{
+    if (!h || !result || !token) { return STM_ERR_INVALID_ARG; }
+    if (h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
+    if (!h->async_owned || token != h->async_token || !h->async_done) { return STM_ERR_INVALID_STATE; }
+    stm_err_t e = h->async_error;
+    if (e == STM_OK) { *result = h->async_result; }
+    clear_sensitive(&h->async_result, sizeof(h->async_result));
+    h->async_owned = h->async_reconnect = 0U;
+    return e;
+}
+stm_err_t esp_hosted_async_cancel(esp_hosted_handle_t h, esp_hosted_async_token_t token)
+{
+    if (!h || !token) { return STM_ERR_INVALID_ARG; }
+    if (h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
+    if (!h->async_owned || token != h->async_token) { return STM_ERR_INVALID_STATE; }
+    if (!h->async_done) {
+        if (h->request_active) { (void)request_finish(h, STM_ERR_CANCELLED, NULL, NULL); }
+        async_complete(h, STM_ERR_CANCELLED);
+    }
+    return STM_OK;
+}
+static stm_err_t async_step(struct esp_hosted_context *h)
+{
+    stm_err_t e = request_step(h);
+    if (e == STM_OK && !h->response_ready) { return STM_OK; }
+    uint8_t response[512]; size_t len = sizeof(response);
+    e = request_finish(h, e, response, &len);
+    if (e == STM_OK && !h->async_monitor && h->async_request.op == EH_WIFI_ASYNC_INIT) {
+        if (!h->async_stage) {
+            h->async_stage = 1U;
+            uint32_t elapsed = HAL_GetTick() - h->async_tick;
+            e = elapsed >= h->async_timeout ? STM_ERR_TIMEOUT :
+                request_begin(h, 259U, NULL, 0U, h->async_timeout - elapsed);
+            if (e == STM_OK) { h->request_tick = h->async_tick; h->request_timeout = h->async_timeout; }
+            clear_sensitive(response, sizeof(response));
+            if (e == STM_OK) { return STM_OK; }
+        } else { h->wifi_initialized = 1U; }
+    } else if (e == STM_OK) {
+        h->async_parse_data = response; h->async_parse_length = len;
+        h->async_internal = h->async_parsing = 1U;
+        e = async_dispatch(h, h->async_timeout);
+        h->async_internal = h->async_parsing = 0U;
+        h->async_parse_data = NULL; h->async_parse_length = 0U;
+    }
+    clear_sensitive(response, sizeof(response));
+    if (e == STM_ERR_VERIFY) { (void)rpc_verify(h); }
+    async_complete(h, e);
+    return STM_OK;
+}
+static stm_err_t enqueue_frame(struct esp_hosted_context *h, uint8_t iface,
+                                const uint8_t *frame, size_t length, uint32_t timeout)
+{
+    if (!h || !frame || length < 14U || length > ESP_HOSTED_STA_MTU + 14U ||
+        !timeout || timeout > INT32_MAX) { return STM_ERR_INVALID_ARG; }
+    if (!h->initialized || h->recovery_phase ||
+        (iface == ESP_HOSTED_STA_IF_TYPE ? !h->connected : !h->ap_up)) { return STM_ERR_INVALID_STATE; }
+    if (h->queued_count == 2U) { esp_hosted_count(&h->diagnostics.tx_queue_full); return STM_ERR_NO_MEM; }
+    uint8_t i = (h->queued_head + h->queued_count) % 2U;
+    memcpy(h->queued_frame[i], frame, length);
+    h->queued_length[i] = (uint16_t)length; h->queued_iface[i] = iface;
+    h->queued_tick[i] = HAL_GetTick(); h->queued_timeout[i] = timeout;
+    ++h->queued_count; h->diagnostics.tx_queue_depth = h->queued_count;
+    esp_hosted_count(&h->diagnostics.tx_enqueued);
+    return STM_OK;
+}
+stm_err_t esp_hosted_send_enqueue(esp_hosted_handle_t h, const uint8_t *frame, size_t length, uint32_t timeout)
+{ return enqueue_frame(h, ESP_HOSTED_STA_IF_TYPE, frame, length, timeout); }
+stm_err_t eh_wifi_ap_send_enqueue(esp_hosted_handle_t h, const uint8_t *frame, size_t length, uint32_t timeout)
+{ return enqueue_frame(h, ESP_HOSTED_AP_IF_TYPE, frame, length, timeout); }
+static void dequeue_frame(struct esp_hosted_context *h)
+{
+    clear_sensitive(h->queued_frame[h->queued_head], sizeof(h->queued_frame[0]));
+    h->queued_head = (h->queued_head + 1U) % 2U; --h->queued_count;
+    h->diagnostics.tx_queue_depth = h->queued_count;
+}
+static stm_err_t service_frames(struct esp_hosted_context *h, uint32_t remaining)
+{
+    while (h->queued_count) {
+        uint8_t i = h->queued_head;
+        uint8_t up = h->queued_iface[i] == ESP_HOSTED_STA_IF_TYPE ? h->connected : h->ap_up;
+        if (!up || !h->initialized) { esp_hosted_count(&h->diagnostics.tx_cleared); dequeue_frame(h); }
+        else if ((uint32_t)(HAL_GetTick() - h->queued_tick[i]) >= h->queued_timeout[i]) {
+            esp_hosted_count(&h->diagnostics.tx_expired); dequeue_frame(h);
+        } else { break; }
+    }
+    if (HAL_GPIO_ReadPin(h->config.handshake_port, h->config.handshake_pin) != GPIO_PIN_SET) { return STM_OK; }
+    uint8_t rx = HAL_GPIO_ReadPin(h->config.data_ready_port, h->config.data_ready_pin) == GPIO_PIN_SET;
+    if (h->queued_count && (!rx || !h->io_last_tx)) {
+        uint8_t i = h->queued_head;
+        stm_err_t e = esp_hosted_encode_frame(h, h->queued_iface[i], 0U, ++h->sequence,
+            h->queued_frame[i], h->queued_length[i], h->config.tx_buffer, ESP_HOSTED_FRAME_SIZE);
+        /* Remove before consuming RX: a callback may append another frame. */
+        dequeue_frame(h); h->io_last_tx = 1U;
+        if (e == STM_OK) { e = bounded_exchange(h, h->config.tx_buffer, remaining); }
+        esp_hosted_count(e == STM_OK ? &h->diagnostics.tx_sent : &h->diagnostics.tx_failures);
+        return e;
+    }
+    h->io_last_tx = 0U;
+    return rx ? bounded_exchange(h, NULL, remaining) : STM_OK;
+}
+stm_err_t eh_wifi_reconnect_update_async(esp_hosted_handle_t h)
+{
+    if (!h) { return STM_ERR_INVALID_ARG; }
+    if (h->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
+    if (h->async_owned) {
+        if (!h->async_reconnect || !h->async_done) { return STM_OK; }
+        esp_hosted_async_result_t ignored;
+        stm_err_t e = esp_hosted_async_take_result(h, h->async_token, &ignored);
+        if (e != STM_OK && !h->connected) { reconnect_schedule(h); }
+        return e;
+    }
+    if (h->request_active || h->recovery_phase || !h->reconnect_config.enabled ||
+        !h->reconnect_armed || !h->wifi_started || !(h->wifi_mode & EH_WIFI_MODE_STA) || h->connected) { return STM_OK; }
+    if (h->connect_pending) {
+        if ((uint32_t)(HAL_GetTick() - h->reconnect_since) < h->reconnect_config.association_timeout_ms) { return STM_OK; }
+        reconnect_schedule(h);
+    }
+    if (!h->reconnect_waiting || (uint32_t)(HAL_GetTick() - h->reconnect_since) < h->reconnect_delay) { return STM_OK; }
+    eh_wifi_async_request_t q = {.op = EH_WIFI_ASYNC_CONNECT};
+    esp_hosted_async_token_t token;
+    stm_err_t e = eh_wifi_async_begin(h, &q, h->reconnect_config.rpc_timeout_ms, &token);
+    if (e == STM_OK) {
+        h->async_reconnect = 1U; h->reconnect_waiting = 0U;
+        if (h->reconnect_attempts < UINT16_MAX) { ++h->reconnect_attempts; }
+        h->reconnect_delay = h->reconnect_delay < h->reconnect_config.max_delay_ms / 2U ?
+            h->reconnect_delay * 2U : h->reconnect_config.max_delay_ms;
+    }
+    return e;
 }

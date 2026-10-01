@@ -9,6 +9,7 @@ typedef uint16_t u16_t;
 #define ERR_BUF -1
 #define ERR_IF -2
 #define ERR_ARG -3
+#define ERR_MEM -4
 #define NETIF_FLAG_BROADCAST 1U
 #define NETIF_FLAG_ETHARP 2U
 #define NETIF_FLAG_ETHERNET 4U

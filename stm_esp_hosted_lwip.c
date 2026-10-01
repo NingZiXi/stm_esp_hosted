@@ -5,13 +5,21 @@
 #include "netif/ethernet.h"
 #include <string.h>
 
+static err_t queued_output(stm_err_t error)
+{
+    if (error == STM_OK) { return ERR_OK; }
+    if (error == STM_ERR_NO_MEM) { return ERR_MEM; }
+    if (error == STM_ERR_INVALID_ARG) { return ERR_BUF; }
+    return ERR_IF;
+}
+
 static err_t sta_output(struct netif *netif, struct pbuf *p)
 {
     esp_hosted_lwip_t *a = (esp_hosted_lwip_t *)netif->state;
     uint8_t frame[ESP_HOSTED_STA_MTU + 14U];
     if (!a || !p || p->tot_len < 14U || p->tot_len > sizeof(frame) ||
         pbuf_copy_partial(p, frame, p->tot_len, 0U) != p->tot_len) { return ERR_BUF; }
-    return esp_hosted_send(a->hosted, frame, p->tot_len) == STM_OK ? ERR_OK : ERR_IF;
+    return queued_output(esp_hosted_send_enqueue(a->hosted, frame, p->tot_len, 1000U));
 }
 static void sta_receive(void *user, const uint8_t *frame, size_t length)
 {
@@ -93,7 +101,7 @@ static err_t ap_output(struct netif *netif, struct pbuf *p)
     uint8_t frame[ESP_HOSTED_STA_MTU + 14U];
     if (!a || !p || p->tot_len < 14U || p->tot_len > sizeof(frame) ||
         pbuf_copy_partial(p, frame, p->tot_len, 0U) != p->tot_len) { return ERR_BUF; }
-    return eh_wifi_ap_send(a->hosted, frame, p->tot_len) == STM_OK ? ERR_OK : ERR_IF;
+    return queued_output(eh_wifi_ap_send_enqueue(a->hosted, frame, p->tot_len, 1000U));
 }
 static void ap_receive(void *user, const uint8_t *frame, size_t length)
 {

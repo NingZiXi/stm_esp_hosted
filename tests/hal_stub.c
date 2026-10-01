@@ -6,6 +6,8 @@ static SCB_Type test_scb;
 SCB_Type *SCB = &test_scb;
 
 static uint32_t test_tick;
+static uint32_t last_spi_timeout;
+uint32_t test_hal_last_spi_timeout(void) { return last_spi_timeout; }
 static GPIO_PinState test_signal = GPIO_PIN_SET;
 void test_hal_set_tick(uint32_t tick) { test_tick = tick; }
 void test_hal_set_signals(GPIO_PinState state) { test_signal = state; }
@@ -38,7 +40,7 @@ HAL_StatusTypeDef HAL_SPI_TransmitReceive(SPI_HandleTypeDef *hspi,
                                           uint32_t timeout)
 {
     (void)hspi;
-    (void)timeout;
+    last_spi_timeout = timeout;
     if (test_spi_status == HAL_OK && tx_data != NULL && rx_data != NULL) {
         if (frame_callback) {
             memset(rx_data, 0, size);

@@ -53,6 +53,18 @@ struct esp_hosted_context {
     uint8_t queued_iface[2];
     uint16_t queued_length[2];
     uint8_t queued_frame[2][ESP_HOSTED_STA_MTU + 14U];
+    uint32_t queued_tick[2], queued_timeout[2];
+    uint8_t io_last_tx;
+    uint8_t request_frame[ESP_HOSTED_FRAME_SIZE];
+    uint32_t async_counter, async_token, async_tick, async_timeout;
+    uint8_t async_owned, async_done, async_stage, async_monitor, async_reconnect;
+    eh_wifi_async_request_t async_request;
+    esp_hosted_monitor_config_t async_monitor_config;
+    esp_hosted_async_result_t async_result;
+    stm_err_t async_error;
+    uint8_t async_internal, async_preparing, async_parsing;
+    const uint8_t *async_parse_data;
+    size_t async_parse_length;
 };
 void esp_hosted_invalidate(struct esp_hosted_context *ctx, esp_hosted_fault_t reason,
                            stm_err_t error, esp_hosted_state_t state);

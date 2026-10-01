@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define STM_ESP_HOSTED_VERSION       "0.7.0"
+#define STM_ESP_HOSTED_VERSION       "0.8.0"
 #define ESP_HOSTED_FRAME_SIZE        1600U
 #define ESP_HOSTED_FRAME_HEADER_SIZE  12U
 #define ESP_HOSTED_FRAME_CHECKSUM_OFFSET 6U
@@ -57,6 +57,8 @@ typedef struct {
      * @brief 是否生成和校验 V1 帧校验和；0 表示关闭。
      */
     uint8_t checksum_enabled;
+    /** Poll/recovery/queued transmission SPI budget; zero uses transfer_timeout_ms. */
+    uint32_t poll_transfer_timeout_ms;
 } esp_hosted_config_t;
 
 typedef struct {
@@ -130,6 +132,8 @@ typedef struct {
     uint32_t spi_failures, checksum_failures, frame_failures;
     uint32_t rpc_timeouts, late_responses, heartbeat_timeouts;
     uint32_t recovery_successes, recovery_failures;
+    uint32_t tx_enqueued, tx_sent, tx_queue_full, tx_expired, tx_cleared, tx_failures;
+    uint8_t tx_queue_depth;
 } esp_hosted_diagnostics_t;
 
 /** @brief 配置 CP 心跳；默认关闭，不自动复位。 */
@@ -262,7 +266,7 @@ typedef struct {
 
 /** @brief 复位、完成 INIT/RPC v2 协商并核对 ESP-Hosted CP 固件 3.0.9。 */
 stm_err_t esp_hosted_start(esp_hosted_handle_t handle, uint32_t timeout_ms);
-/** @brief 轮询一次 SPI；没有待收帧时立即返回。 */
+/** @brief 推进任务、恢复及帧队列；至多一次 SPI，无 Handshake 时立即返回。 */
 stm_err_t esp_hosted_poll(esp_hosted_handle_t handle);
 /** @brief 注册 STA 接收及链路回调；可传 NULL 取消。 */
 stm_err_t esp_hosted_set_callbacks(esp_hosted_handle_t handle,
@@ -371,6 +375,74 @@ typedef struct {
     int8_t rssi;
     uint8_t authmode;
 } eh_wifi_ap_record_t;
+
+typedef uint32_t esp_hosted_async_token_t;
+typedef enum { ESP_HOSTED_ASYNC_PENDING, ESP_HOSTED_ASYNC_DONE } esp_hosted_async_state_t;
+typedef struct { esp_hosted_async_state_t state; stm_err_t error; } esp_hosted_async_status_t;
+typedef enum {
+    EH_WIFI_ASYNC_INIT, EH_WIFI_ASYNC_SET_MODE, EH_WIFI_ASYNC_GET_MODE,
+    EH_WIFI_ASYNC_SET_CONFIG, EH_WIFI_ASYNC_GET_CONFIG, EH_WIFI_ASYNC_GET_MAC,
+    EH_WIFI_ASYNC_START, EH_WIFI_ASYNC_STOP, EH_WIFI_ASYNC_CONNECT, EH_WIFI_ASYNC_DISCONNECT,
+    EH_WIFI_ASYNC_SET_PROTOCOL, EH_WIFI_ASYNC_GET_PROTOCOL,
+    EH_WIFI_ASYNC_SET_BANDWIDTH, EH_WIFI_ASYNC_GET_BANDWIDTH,
+    EH_WIFI_ASYNC_SET_COUNTRY_CODE, EH_WIFI_ASYNC_GET_COUNTRY_CODE, EH_WIFI_ASYNC_GET_COUNTRY,
+    EH_WIFI_ASYNC_SET_PS, EH_WIFI_ASYNC_GET_PS,
+    EH_WIFI_ASYNC_SET_MAX_TX_POWER, EH_WIFI_ASYNC_GET_MAX_TX_POWER,
+    EH_WIFI_ASYNC_GET_RSSI, EH_WIFI_ASYNC_GET_CHANNEL, EH_WIFI_ASYNC_GET_AP_INFO,
+} eh_wifi_async_op_t;
+typedef struct {
+    eh_wifi_async_op_t op;
+    eh_wifi_if_t iface;
+    union {
+        eh_wifi_mode_t mode;
+        eh_wifi_config_t config;
+        uint8_t protocol;
+        eh_wifi_bandwidth_t bandwidth;
+        struct { char code[3]; uint8_t ieee80211d_enabled; } country;
+        eh_wifi_ps_t ps;
+        int8_t power;
+    } value;
+} eh_wifi_async_request_t;
+typedef union {
+    eh_wifi_mode_t mode;
+    eh_wifi_config_info_t config;
+    uint8_t mac[6];
+    uint8_t protocol;
+    eh_wifi_bandwidth_t bandwidth;
+    char country_code[4];
+    eh_wifi_country_info_t country;
+    eh_wifi_ps_t ps;
+    int8_t power, rssi;
+    struct { uint8_t primary; eh_wifi_second_chan_t second; } channel;
+    eh_wifi_ap_record_t ap;
+} esp_hosted_async_result_t;
+
+/** Copies and validates input without SPI. poll advances one task, including its
+ * total deadline. DONE retains the sole slot until take_result. Credentials are
+ * retained only in temporary encoded data; results never contain passwords.
+ * Submission failure leaves token unchanged. Not callable from callbacks. */
+stm_err_t eh_wifi_async_begin(esp_hosted_handle_t handle, const eh_wifi_async_request_t *request,
+                             uint32_t timeout_ms, esp_hosted_async_token_t *token);
+stm_err_t esp_hosted_monitor_begin(esp_hosted_handle_t handle, const esp_hosted_monitor_config_t *config,
+                                  uint32_t timeout_ms, esp_hosted_async_token_t *token);
+/** Local snapshot only; does not advance work. Allowed within callbacks. */
+stm_err_t esp_hosted_async_get_status(esp_hosted_handle_t handle, esp_hosted_async_token_t token,
+                                     esp_hosted_async_status_t *status);
+/** A failed task is consumed and returns its error without modifying result. */
+stm_err_t esp_hosted_async_take_result(esp_hosted_handle_t handle, esp_hosted_async_token_t token,
+                                      esp_hosted_async_result_t *result);
+/** Local cancellation produces DONE/CANCELLED; take_result still releases the
+ * slot. Repeated cancellation preserves an already completed result. */
+stm_err_t esp_hosted_async_cancel(esp_hosted_handle_t handle, esp_hosted_async_token_t token);
+/** Copies a complete Ethernet frame into the shared two-slot STA/AP FIFO.
+ * Success means queued, not delivered. Nonzero timeout is measured from enqueue.
+ * Callback enqueue is allowed; full returns NO_MEM without replacing old data. */
+stm_err_t esp_hosted_send_enqueue(esp_hosted_handle_t handle, const uint8_t *frame,
+                                  size_t length, uint32_t timeout_ms);
+stm_err_t eh_wifi_ap_send_enqueue(esp_hosted_handle_t handle, const uint8_t *frame,
+                                 size_t length, uint32_t timeout_ms);
+/** Poll-based reconnect. A busy slot defers without consuming an attempt. */
+stm_err_t eh_wifi_reconnect_update_async(esp_hosted_handle_t handle);
 /** Snapshot maintained by RPC replies and asynchronous Wi-Fi events; no RPC is sent. */
 typedef struct {
     eh_wifi_mode_t mode;

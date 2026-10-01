@@ -89,12 +89,19 @@ int main(void)
     CHECK(pbuf_take(first,payload,sizeof(payload))==ERR_OK);
     h->initialized=1;
     CHECK(n.linkoutput(&n,first)==ERR_OK);
+    CHECK(h->queued_count==1U);
+    CHECK(esp_hosted_poll(h)==STM_OK);
     esp_hosted_frame_t decoded;
     CHECK(esp_hosted_decode_frame(h,tx,sizeof(tx),&decoded)==ESP_HOSTED_FRAME_OK);
     CHECK(decoded.payload_length==sizeof(payload) && memcmp(decoded.payload,payload,sizeof(payload))==0);
     CHECK(ap.linkoutput(&ap,first)==ERR_OK);
+    h->io_last_tx=0U;
+    CHECK(esp_hosted_poll(h)==STM_OK);
     CHECK(esp_hosted_decode_frame(h,tx,sizeof(tx),&decoded)==ESP_HOSTED_FRAME_OK);
     CHECK(decoded.if_type==ESP_HOSTED_AP_IF_TYPE && decoded.payload_length==sizeof(payload));
+    CHECK(n.linkoutput(&n,first)==ERR_OK && ap.linkoutput(&ap,first)==ERR_OK);
+    CHECK(n.linkoutput(&n,first)==ERR_MEM);
+    while(h->queued_count) { CHECK(esp_hosted_poll(h)==STM_OK); }
     pbuf_free(first);
     const uint8_t ap_down[]={1,0,0,2,10,0,8,3,16,0x85,6,0xAA,0x30,2,16,13};
     CHECK(esp_hosted_encode_frame(h,3,0,1,ap_down,sizeof(ap_down),frame,sizeof(frame))==STM_OK);

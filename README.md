@@ -64,7 +64,48 @@ if (eh_wifi_get_mode(host, &mode, 5000U) == STM_OK && mode == EH_WIFI_MODE_STA &
 
 这些同步 RPC 应在完成 `eh_wifi_init()` 和相应模式设置后调用。省电模式需要 STA 或 AP+STA 模式。查询与控制接口不应从组件回调内重入。
 
-凭据存放在应用的本地忽略配置中，不要写入组件源码、公开仓库或日志。STA/AP 一帧最长 1514 字节；短于 Ethernet 头部或超过上限的帧会被拒绝。当前 API 不支持并发调用，也不要在组件回调内重入发送或控制 API。AP 演示已通过单客户端 HTTP/TCP 和手机 UDP 回显；多个客户端并发和长期运行尚未覆盖。
+凭据存放在应用的本地忽略配置中，不要写入组件源码、公开仓库或日志。STA/AP 一帧最长 1514 字节；短于 Ethernet 头部或超过上限的帧会被拒绝。API 不支持多线程并发；组件回调内允许下述帧入队和本地状态读取，禁止同步发送、控制、领取及取消任务。AP 演示已通过单客户端 HTTP/TCP 和手机 UDP 回显；多个客户端并发和长期运行尚未覆盖。
+
+## 异步任务与有界轮询（v0.8.0）
+
+`eh_wifi_async_begin(host, &request, timeout_ms, &token)` 校验、复制参数并提交有类型的任务，入口不等待 SPI 或 CP。提交成功表示受理；`esp_hosted_poll()` 推进发送、响应解析及截止时间。请求使用 `eh_wifi_async_request_t.op/iface/value`，结果使用不含密码的 `esp_hosted_async_result_t`；每种查询对应其同名结果成员。Wi-Fi INIT 的多个 RPC 共用从提交时开始的总超时。凭据仅保留发送必需的临时编码，发送、失败、取消或会话失效时清除；应用仍负责清除自己的凭据副本。
+
+异步操作覆盖初始化、模式与 STA/AP 配置、MAC、启动/停止、连接/断开、协议/带宽、国家码/国家信息、省电及功率，以及 RSSI、实际信道和关联 AP 信息。`esp_hosted_monitor_begin()` 配置心跳并使用同一任务槽。扫描结果、AP 客户端列表/AID/主动断开及信道设置继续使用既有接口。
+
+一个句柄只有一个控制任务槽，状态为 `PENDING` 或 `DONE`。`esp_hosted_async_get_status()` 只读取本地状态，不推进事务；DONE 的 `error` 是最终错误码。`esp_hosted_async_take_result()` 在成功时写入结果并释放槽，失败时返回最终错误、保持结果输出不变并释放槽；PENDING 时返回状态错误且不释放。完成但未领取的结果仍占用槽，第二次提交或同步控制 RPC 返回状态错误。领取后 token 失效；token 单调递增且非零，耗尽返回范围错误，不复用旧值。
+
+`esp_hosted_async_cancel()` 本地终止未完成任务，形成一次 DONE/CANCELLED，不等待 CP；仍须领取以释放槽。重复取消不覆盖已有完成结果。会话失效将旧任务（包括未领取的成功结果）改为 CANCELLED；单调 RPC UID 隔离迟到响应。恢复前先取消并领取旧任务，恢复期间不能提交公共控制任务。控制入口、领取及取消禁止回调重入；状态读取允许。
+
+```c
+static esp_hosted_async_token_t query_token;
+/* 从主循环调用；返回后继续服务外设和 lwIP。 */
+static stm_err_t begin_rssi(esp_hosted_handle_t host)
+{
+    const eh_wifi_async_request_t request = {.op = EH_WIFI_ASYNC_GET_RSSI};
+    return eh_wifi_async_begin(host, &request, 5000U, &query_token);
+}
+static void service_rssi(esp_hosted_handle_t host)
+{
+    esp_hosted_async_status_t status;
+    if (!query_token || esp_hosted_async_get_status(host, query_token, &status) != STM_OK ||
+        status.state != ESP_HOSTED_ASYNC_DONE) { return; }
+    esp_hosted_async_result_t result;
+    stm_err_t error = esp_hosted_async_take_result(host, query_token, &result);
+    query_token = 0U;
+    if (error == STM_OK) { /* 使用 result.rssi，单位 dBm。 */ }
+    else { /* 单独处理超时、取消或 CP 错误。 */ }
+}
+```
+
+每次 `esp_hosted_poll()` 最多一次 SPI 交换，无 Handshake 立即返回。配置末尾的 `poll_transfer_timeout_ms` 为单次轮询 SPI 等待预算，零值沿用 `transfer_timeout_ms`；H723 演示显式设为 10 ms，且受剩余事务超时约束。控制请求有独立暂存并优先发送；等待控制响应时继续处理 Ethernet、事件及心跳，普通收发轮流服务。HAL 单帧 SPI 仍阻塞；应用回调、日志和其他操作也必须有界。
+
+同步 API 的签名和阻塞语义保留，复用同一编码、解析和事务核心；它们不保证上述应用响应性。响应性路径使用异步启动、原配置快照与重放、运行查询及 `eh_wifi_reconnect_update_async()`；控制槽忙时自动重连等待，不消耗尝试次数。原 `eh_wifi_reconnect_update()` 仍可执行同步连接 RPC。传输 READY 后的配置重放和 DHCP/DNS/通信恢复继续由应用负责，不由组件保存密码或自动重放。
+
+## Ethernet 发送队列
+
+`esp_hosted_send_enqueue()`（STA）和 `eh_wifi_ap_send_enqueue()`（AP）立即复制完整帧，接收非零排队超时；STA/AP 共用两槽 FIFO。成功仅表示入队，不保证 CP 已接收或对端交付。队列满返回 `STM_ERR_NO_MEM`，不覆盖旧帧；链路不可用返回状态错误。帧过期、对应链路下线或会话失效时清除；STA 下线不丢弃仍有效的 AP 帧。SPI 失败后不重发交付状态不确定的 Ethernet 帧。
+
+入队允许在回调内执行。lwIP `linkoutput` 使用 1000 ms 排队超时，将队列满映射为 `ERR_MEM`、参数错误映射为 `ERR_BUF`、不可用等状态映射为 `ERR_IF`；应用和 lwIP 协议负责处理错误。原同步 `esp_hosted_send()` / `eh_wifi_ap_send()` 保留。诊断新增 `tx_enqueued/tx_sent/tx_queue_full/tx_expired/tx_cleared/tx_failures/tx_queue_depth`，累计计数饱和且恢复不清零；`tx_sent` 表示 HAL 交换成功，不代表网络对端确认。
 
 ## 协议与带宽配置
 
@@ -236,3 +277,19 @@ CN MANUAL 与 AUTO/802.11d 各十轮 DHCP 保持、真实 DNS、TCP/UDP，20/20 
 自动检查覆盖重复 INIT、无数据、心跳启停/超时、计时回绕、事务取消/互斥、迟到响应、回调重入、恢复成功/失败、诊断饱和计数、STA 地址/ARP 清理、AP 租约清理和重复启停，以及国家/信道/功率参数边界、默认值省略、错误状态字段、畸形/超长响应和失败时输出不变。组件测试 3/3、H723 正常/专项固件、H723/H757 C/C++ 接口及聚合编译、现有 ESP-IDF CP 固件构建通过。
 
 本轮仅覆盖所列异常恢复与功能配置；功率读回和通信不代表实际射频输出测量，HT40 仍只是配置值。不新增长期运行、吞吐或整板断电稳定性结论。原始日志、故障注入和逐次记录及凭据只留本地。
+
+### v0.8.0 响应性验收（2026-10-01 至 2026-10-02）
+
+改造前在同一 H723 上测得：正常主循环最大约 17.9 ms，无响应 RPC 等待约 5 秒、Handshake 不就绪约 1 秒、配置重放单步约 166.2 ms。基线故障仅用于定位阻塞，未计为联网通过。
+
+改造后自动阶段完成正常启动十轮、故障后十轮约 60 秒间隔 DHCP 保持、全新 DNS 及电脑真实 TCP/UDP 回显，20/20 零失败或缺失。RSSI/国家信息/功率查询各三次延迟 1500 ms 正确完成，各三次丢弃响应按 5 秒总超时结束，失败输出不变且下一任务正常；三次发送后取消及迟到响应隔离通过。三次 CP 独立复位（含查询等待中一次）及 EN 低 40 秒的心跳失联均恢复新 DHCP/DNS/双协议通路，释放后最慢约 23.1 秒。Handshake 长期不就绪、两槽满队列/过期、模拟 SPI 超时均单独验收，不计为联网成功。
+
+AP+STA 下单手机取得新有效 DHCP 租约并确认 HTTP 页面及新 UDP 原样回复；同时十轮 STA 周期通信、九次 1500 ms 延迟查询全部通过。手机准备后 CP 独立复位，STA 约 21.5 秒恢复，手机关联后约 4.3 秒恢复新租约及 HTTP/UDP；最后原配置重放、读回及两端复测通过，STA 约 20.9 秒、手机关联后约 3.6 秒恢复。STA 限时从 CP 释放开始，手机限时从新关联开始，均小于 90 秒。最初手机组的完成间隔检查受 UDP 重试耗时影响，修正为实际调度的开始间隔后十轮从头重测通过，失败尝试未计入通过轮次。
+
+从联网状态机开始，用 H723 DWT 记录轮询、主循环、`sys_check_timeouts()` 服务间隔和 10 ms 测试定时器到期延迟；统计包含配置重放、查询等待、CP 恢复及上述预期故障。全部验收最大值分别约 **9.563 / 9.661 / 9.599 / 5.034 ms**，均不超过 20 ms，单次轮询 SPI 超时预算为 10 ms。CubeMX 初始化及其他同步存储专项不在测量范围；使用内存统计和分钟汇总，避免逐帧日志影响。正式演示关闭专项与故障入口后另做启动及 CP 独立复位恢复回归。
+
+复现时准备忽略的本地凭据、保持原电脑网络及真实 TCP/UDP echo 服务，开启 ESP-Hosted/STA/AP 及默认关闭的 `CONFIG_APP_ESP_HOSTED_RESPONSIVENESS_TESTS`。仅本地测试再开启 `CONFIG_APP_ESP_HOSTED_LOCAL_FAULT_INJECTION`，不能与旧 INFO/PS/CLIENT/SCAN/RADIO/恢复/地区/功率专项同时开启。先运行自动阶段；手机阶段分别在初始、CP 复位和原配置恢复准备门确认手机已忘记热点、工具就绪后启动，核对新租约、HTTP 和新 UDP 回复。演示每轮最多提交或领取一个控制任务，并持续服务 lwIP 定时器。
+
+模拟测试覆盖任务生命周期、总超时、取消/重复领取、token/UID 边界、计时回绕、同步异步互斥、回调重入、会话失效/迟到隔离、严格解析及失败输出不变；队列覆盖 FIFO/帧副本/满队列、STA/AP 隔离、过期/会话清除、收发公平性及 RPC 等待期间 Ethernet/心跳处理。组件测试 3/3、H723 默认/专项构建、H723/H757 C/C++ 接口及聚合编译、现有 ESP-IDF CP 3.0.9 固件构建通过。
+
+结论限定当前 H723、SPI 配置及有界应用回调，不构成硬实时保证，不新增吞吐、长期运行或整板断电稳定性结论。CP 固件未升级；凭据、原始日志、故障注入和逐次记录仅留本地。

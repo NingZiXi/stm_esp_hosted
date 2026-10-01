@@ -1213,6 +1213,197 @@ static int test_receive_queue(void)
     TEST_ASSERT(esp_hosted_delete(&h)==STM_OK);return 0;
 }
 
+static uint8_t async_held[1600];
+static unsigned async_hold, async_release, async_calls;
+static uint8_t async_rx_next, async_eth_order[4];
+static unsigned async_eth_sent;
+static void async_mock_cp(const uint8_t *tx, uint8_t *rx, uint16_t n)
+{
+    ++async_calls;
+    if((tx[0]&15U)==ESP_HOSTED_STA_IF_TYPE || (tx[0]&15U)==ESP_HOSTED_AP_IF_TYPE) {
+        if(async_eth_sent<4U)async_eth_order[async_eth_sent++]=tx[0]&15U;
+    }
+    if(async_rx_next && (tx[0]&15U)==ESP_HOSTED_DUMMY_IF_TYPE) {
+        if(async_rx_next==1U) {
+            const uint8_t heartbeat[]={1,0,0,2,7,0,8,3,16,0x82,6,0x92,0x30,0};
+            /* Message body includes omitted default sequence. */
+            uint8_t rpc[16],wire[32];size_t pn=0,wn=0;
+            (void)heartbeat;
+            pn+=test_put_num(rpc+pn,1,3);pn+=test_put_num(rpc+pn,2,770);
+            pn+=test_put_bytes(rpc+pn,770,NULL,0);
+            wire[wn++]=1;wire[wn++]=0;wire[wn++]=0;wire[wn++]=2;wire[wn++]=(uint8_t)pn;wire[wn++]=0;
+            memcpy(wire+wn,rpc,pn);wn+=pn;
+            (void)esp_hosted_encode_frame(mock_host,3,0,2,wire,wn,rx,n);
+        } else {
+            uint8_t ethernet[14]={9};
+            (void)esp_hosted_encode_frame(mock_host,ESP_HOSTED_STA_IF_TYPE,0,2,ethernet,sizeof(ethernet),rx,n);
+        }
+        async_rx_next=0;return;
+    }
+    if (async_release && (tx[0]&15U)==ESP_HOSTED_DUMMY_IF_TYPE) {
+        memcpy(rx,async_held,n);async_release=0U;return;
+    }
+    mock_cp(tx,rx,n);
+    if(async_hold && (tx[0]&15U)==3U) {memcpy(async_held,rx,n);memset(rx,0,n);}
+}
+static int async_wait(esp_hosted_handle_t h,esp_hosted_async_token_t t,esp_hosted_async_result_t *r)
+{
+    for(unsigned i=0;i<1000;++i) {
+        esp_hosted_async_status_t status;
+        if(esp_hosted_async_get_status(h,t,&status)!=STM_OK)return STM_ERR_INVALID_STATE;
+        if(status.state==ESP_HOSTED_ASYNC_DONE)return esp_hosted_async_take_result(h,t,r);
+        uint32_t before=h->info.transfer_count;
+        if(esp_hosted_poll(h)!=STM_OK || h->info.transfer_count-before>1U)return STM_ERR_VERIFY;
+    }
+    return STM_ERR_TIMEOUT;
+}
+static int test_async_tasks(void)
+{
+    static uint8_t tx[1600] __attribute__((aligned(32))),rx[1600] __attribute__((aligned(32)));
+    esp_hosted_handle_t h=make_handle(tx,rx,ESP_HOSTED_DUMMY_IF_TYPE);
+    TEST_ASSERT(h);mock_host=h;mock_stage=0;mock_requests=mock_error_mode=query_fault=radio_fault=advanced_fault=runtime_fault=0;
+    mock_connect_event=mock_disconnect_event=0;mock_mode=EH_WIFI_MODE_APSTA;mock_ps=1;
+    test_hal_set_spi_status(HAL_OK);test_hal_set_signals(GPIO_PIN_SET);test_hal_set_frame_callback(async_mock_cp);
+    TEST_ASSERT(esp_hosted_start(h,1000)==STM_OK);
+    eh_wifi_async_request_t q={.op=EH_WIFI_ASYNC_INIT};esp_hosted_async_token_t t=99,other;
+    esp_hosted_async_result_t r,old;memset(&r,0xA5,sizeof(r));old=r;
+    unsigned count=async_calls;
+    TEST_ASSERT(eh_wifi_async_begin(h,&q,500,&t)==STM_OK && t==1 && async_calls==count);
+    TEST_ASSERT(esp_hosted_async_take_result(h,t,&r)==STM_ERR_INVALID_STATE && !memcmp(&r,&old,sizeof(r)));
+    TEST_ASSERT(eh_wifi_init(h,100)==STM_ERR_INVALID_STATE && esp_hosted_recover_begin(h,100)==STM_ERR_INVALID_STATE);
+    TEST_ASSERT(eh_wifi_async_begin(h,&q,100,&other)==STM_ERR_INVALID_STATE);
+    TEST_ASSERT(async_wait(h,t,&r)==STM_OK && h->wifi_initialized);
+    TEST_ASSERT(esp_hosted_async_take_result(h,t,&r)==STM_ERR_INVALID_STATE);
+    q.op=EH_WIFI_ASYNC_SET_MODE;q.value.mode=EH_WIFI_MODE_APSTA;
+    TEST_ASSERT(eh_wifi_async_begin(h,&q,500,&t)==STM_OK && async_wait(h,t,&r)==STM_OK && h->wifi_mode==3);
+    q.op=EH_WIFI_ASYNC_SET_CONFIG;q.iface=EH_WIFI_IF_STA;memset(&q.value,0,sizeof(q.value));
+    strcpy(q.value.config.sta.ssid,"test-sta");strcpy(q.value.config.sta.password,"private-password");
+    TEST_ASSERT(eh_wifi_async_begin(h,&q,500,&t)==STM_OK);
+    TEST_ASSERT(!h->async_request.value.config.sta.password[0]);
+    memset(&q.value,0,sizeof(q.value));
+    TEST_ASSERT(async_wait(h,t,&r)==STM_OK);
+    for(unsigned i=0;i<sizeof(h->request_frame);++i)TEST_ASSERT(h->request_frame[i]==0);
+    q.op=EH_WIFI_ASYNC_START;
+    TEST_ASSERT(eh_wifi_async_begin(h,&q,500,&t)==STM_OK && async_wait(h,t,&r)==STM_OK && h->wifi_started);
+    h->connected=h->ap_up=1;
+    const eh_wifi_async_op_t queries[]={EH_WIFI_ASYNC_GET_MODE,EH_WIFI_ASYNC_GET_MAC,EH_WIFI_ASYNC_GET_CONFIG,
+        EH_WIFI_ASYNC_GET_PROTOCOL,EH_WIFI_ASYNC_GET_BANDWIDTH,EH_WIFI_ASYNC_GET_COUNTRY_CODE,
+        EH_WIFI_ASYNC_GET_COUNTRY,EH_WIFI_ASYNC_GET_PS,EH_WIFI_ASYNC_GET_MAX_TX_POWER,
+        EH_WIFI_ASYNC_GET_RSSI,EH_WIFI_ASYNC_GET_CHANNEL,EH_WIFI_ASYNC_GET_AP_INFO};
+    for(unsigned i=0;i<sizeof(queries)/sizeof(*queries);++i){
+        q.op=queries[i];q.iface=EH_WIFI_IF_STA;
+        TEST_ASSERT(eh_wifi_async_begin(h,&q,500,&t)==STM_OK);
+        TEST_ASSERT(async_wait(h,t,&r)==STM_OK);
+    }
+    q.op=EH_WIFI_ASYNC_GET_CONFIG;query_fault=1;
+    memset(&r,0xA5,sizeof(r));old=r;
+    TEST_ASSERT(eh_wifi_async_begin(h,&q,500,&t)==STM_OK && async_wait(h,t,&r)==STM_ERR_IO && !memcmp(&r,&old,sizeof(r)));
+    query_fault=0;q.op=EH_WIFI_ASYNC_GET_RSSI;runtime_fault=4;
+    TEST_ASSERT(eh_wifi_async_begin(h,&q,500,&t)==STM_OK && async_wait(h,t,&r)==STM_ERR_VERIFY && !memcmp(&r,&old,sizeof(r)));
+    runtime_fault=0;async_hold=1;q.op=EH_WIFI_ASYNC_GET_COUNTRY;
+    test_hal_set_tick(UINT32_MAX-15);
+    TEST_ASSERT(eh_wifi_async_begin(h,&q,50,&t)==STM_OK);
+    TEST_ASSERT(async_wait(h,t,&r)==STM_ERR_TIMEOUT && !memcmp(&r,&old,sizeof(r)));
+    TEST_ASSERT(h->diagnostics.rpc_timeouts>0);
+    test_hal_set_tick(100);TEST_ASSERT(eh_wifi_async_begin(h,&q,500,&t)==STM_OK);
+    TEST_ASSERT(esp_hosted_poll(h)==STM_OK && h->request_sent);
+    TEST_ASSERT(esp_hosted_async_cancel(h,t)==STM_OK && esp_hosted_async_cancel(h,t)==STM_OK);
+    TEST_ASSERT(esp_hosted_async_take_result(h,t,&r)==STM_ERR_CANCELLED && !memcmp(&r,&old,sizeof(r)));
+    async_hold=0;async_release=1;unsigned late=h->diagnostics.late_responses;
+    TEST_ASSERT(esp_hosted_poll(h)==STM_OK && h->diagnostics.late_responses==late+1);
+    TEST_ASSERT(eh_wifi_async_begin(h,&q,500,&t)==STM_OK);
+    while(!h->async_done)TEST_ASSERT(esp_hosted_poll(h)==STM_OK);
+    TEST_ASSERT(eh_wifi_get_country(h,&r.country,100)==STM_ERR_INVALID_STATE);
+    TEST_ASSERT(esp_hosted_reset(h,10,100)==STM_OK);
+    TEST_ASSERT(esp_hosted_async_take_result(h,t,&r)==STM_ERR_CANCELLED && !memcmp(&r,&old,sizeof(r)));
+    mock_stage=0;TEST_ASSERT(esp_hosted_start(h,1000)==STM_OK);
+    h->wifi_initialized=1;h->wifi_mode=3;h->wifi_started=1;
+    h->async_counter=UINT32_MAX;
+    TEST_ASSERT(eh_wifi_async_begin(h,&q,500,&t)==STM_ERR_OUT_OF_RANGE);
+    h->async_counter=10;h->uid=UINT32_MAX;
+    TEST_ASSERT(eh_wifi_async_begin(h,&q,500,&t)==STM_ERR_OUT_OF_RANGE);
+    h->uid=100;h->callback_depth=1;
+    TEST_ASSERT(eh_wifi_async_begin(h,&q,500,&t)==STM_ERR_INVALID_CONTEXT);
+    h->callback_depth=0;
+    esp_hosted_monitor_config_t monitor={1,10,35000};
+    TEST_ASSERT(esp_hosted_monitor_begin(h,&monitor,500,&t)==STM_OK && async_wait(h,t,&r)==STM_OK);
+    TEST_ASSERT(h->monitor.enabled);
+    /* While an RPC response is held, queued TX alternates with RX; heartbeat
+     * and Ethernet callbacks keep running. The encoded RPC remains isolated. */
+    uint8_t frame[14]={0};h->connected=h->ap_up=1;
+    TEST_ASSERT(esp_hosted_set_callbacks(h,receive_cb,NULL,NULL)==STM_OK);
+    q.op=EH_WIFI_ASYNC_GET_COUNTRY;async_hold=1;async_eth_sent=0;
+    TEST_ASSERT(eh_wifi_async_begin(h,&q,500,&t)==STM_OK);
+    TEST_ASSERT(esp_hosted_send_enqueue(h,frame,sizeof(frame),500)==STM_OK);
+    TEST_ASSERT(eh_wifi_ap_send_enqueue(h,frame,sizeof(frame),500)==STM_OK);
+    TEST_ASSERT(esp_hosted_poll(h)==STM_OK && h->request_sent && h->queued_count==2);
+    h->io_last_tx=0;uint32_t hb_before=h->heartbeat_tick;async_rx_next=1;
+    TEST_ASSERT(esp_hosted_poll(h)==STM_OK && h->queued_count==1 && async_rx_next==1);
+    TEST_ASSERT(esp_hosted_poll(h)==STM_OK && h->queued_count==1 && !async_rx_next && h->heartbeat_tick>hb_before);
+    TEST_ASSERT(esp_hosted_poll(h)==STM_OK && !h->queued_count);
+    async_rx_next=2;received_length=0;
+    TEST_ASSERT(esp_hosted_poll(h)==STM_OK && received_length==14U);
+    TEST_ASSERT(async_eth_sent==2 && async_eth_order[0]==ESP_HOSTED_STA_IF_TYPE && async_eth_order[1]==ESP_HOSTED_AP_IF_TYPE);
+    async_hold=0;async_release=1;
+    TEST_ASSERT(async_wait(h,t,&r)==STM_OK);
+    /* A composite INIT shares one deadline, including the second request. */
+    h->monitor.enabled=0;h->wifi_initialized=0;q.op=EH_WIFI_ASYNC_INIT;
+    test_hal_set_tick(1000);
+    TEST_ASSERT(eh_wifi_async_begin(h,&q,100,&t)==STM_OK);
+    uint32_t deadline_start=h->async_tick;
+    TEST_ASSERT(esp_hosted_poll(h)==STM_OK && h->async_stage==1U);
+    TEST_ASSERT(h->request_tick==deadline_start && h->request_timeout==100U);
+    test_hal_set_tick(deadline_start+100U);
+    TEST_ASSERT(async_wait(h,t,&r)==STM_ERR_TIMEOUT && !h->wifi_initialized);
+    h->wifi_initialized=1;q.op=EH_WIFI_ASYNC_GET_MODE;
+    unsigned before_cancel=async_calls;
+    TEST_ASSERT(eh_wifi_async_begin(h,&q,500,&t)==STM_OK);
+    TEST_ASSERT(esp_hosted_async_cancel(h,t)==STM_OK);
+    TEST_ASSERT(esp_hosted_async_take_result(h,t,&r)==STM_ERR_CANCELLED && async_calls==before_cancel);
+    h->wifi_initialized=1;
+    const eh_wifi_async_op_t setters[]={EH_WIFI_ASYNC_SET_PROTOCOL,EH_WIFI_ASYNC_SET_BANDWIDTH,
+        EH_WIFI_ASYNC_SET_COUNTRY_CODE,EH_WIFI_ASYNC_SET_PS,EH_WIFI_ASYNC_SET_MAX_TX_POWER,
+        EH_WIFI_ASYNC_DISCONNECT,EH_WIFI_ASYNC_CONNECT,EH_WIFI_ASYNC_STOP,EH_WIFI_ASYNC_START};
+    for(unsigned i=0;i<sizeof(setters)/sizeof(*setters);++i) {
+        memset(&q,0,sizeof(q));q.op=setters[i];q.iface=EH_WIFI_IF_STA;
+        if(q.op==EH_WIFI_ASYNC_SET_PROTOCOL)q.value.protocol=7;
+        if(q.op==EH_WIFI_ASYNC_SET_BANDWIDTH)q.value.bandwidth=EH_WIFI_BW_HT20;
+        if(q.op==EH_WIFI_ASYNC_SET_COUNTRY_CODE)memcpy(q.value.country.code,"CN",3);
+        if(q.op==EH_WIFI_ASYNC_SET_PS)q.value.ps=EH_WIFI_PS_NONE;
+        if(q.op==EH_WIFI_ASYNC_SET_MAX_TX_POWER)q.value.power=44;
+        TEST_ASSERT(eh_wifi_async_begin(h,&q,500,&t)==STM_OK && async_wait(h,t,&r)==STM_OK);
+    }
+    monitor.interval_s=9;
+    TEST_ASSERT(esp_hosted_monitor_begin(h,&monitor,500,&t)==STM_ERR_INVALID_ARG);
+    test_hal_set_frame_callback(NULL);TEST_ASSERT(esp_hosted_delete(&h)==STM_OK);return 0;
+}
+static int test_tx_queue_bounds(void)
+{
+    static uint8_t tx[1600] __attribute__((aligned(32))),rx[1600] __attribute__((aligned(32)));
+    uint8_t a[14]={1},b[14]={2};
+    esp_hosted_handle_t h=make_handle(tx,rx,ESP_HOSTED_DUMMY_IF_TYPE);TEST_ASSERT(h);
+    h->initialized=h->connected=h->ap_up=1;h->diagnostics.state=ESP_HOSTED_STATE_READY;
+    test_hal_set_frame_callback(NULL);test_hal_set_signals(GPIO_PIN_RESET);test_hal_set_tick(UINT32_MAX-10);
+    TEST_ASSERT(esp_hosted_send_enqueue(h,a,sizeof(a),100)==STM_OK);
+    TEST_ASSERT(eh_wifi_ap_send_enqueue(h,b,sizeof(b),100)==STM_OK);
+    TEST_ASSERT(esp_hosted_send_enqueue(h,a,sizeof(a),100)==STM_ERR_NO_MEM);
+    memset(a,0,sizeof(a));TEST_ASSERT(h->queued_frame[h->queued_head][0]==1);
+    uint32_t transfers=h->info.transfer_count;TEST_ASSERT(esp_hosted_poll(h)==STM_OK && transfers==h->info.transfer_count);
+    test_hal_set_tick(150);TEST_ASSERT(esp_hosted_poll(h)==STM_OK && !h->queued_count && h->diagnostics.tx_expired==2);
+    test_hal_set_signals(GPIO_PIN_SET);h->config.poll_transfer_timeout_ms=10;
+    TEST_ASSERT(esp_hosted_send_enqueue(h,a,sizeof(a),100)==STM_OK);
+    test_hal_set_spi_status(HAL_TIMEOUT);
+    TEST_ASSERT(esp_hosted_poll(h)==STM_ERR_TIMEOUT && !h->queued_count && h->diagnostics.tx_failures==1);
+    TEST_ASSERT(test_hal_last_spi_timeout()<=10U);
+    test_hal_set_spi_status(HAL_OK);
+    TEST_ASSERT(esp_hosted_send_enqueue(h,a,sizeof(a),100)==STM_OK);
+    h->connected=0;TEST_ASSERT(esp_hosted_poll(h)==STM_OK && !h->queued_count && h->diagnostics.tx_cleared==1);
+    TEST_ASSERT(esp_hosted_send_enqueue(h,a,sizeof(a),100)==STM_ERR_INVALID_STATE);
+    TEST_ASSERT(esp_hosted_send_enqueue(h,a,13,100)==STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_ap_send_enqueue(h,b,sizeof(b),0)==STM_ERR_INVALID_ARG);
+    TEST_ASSERT(esp_hosted_reset(h,10,100)==STM_OK && esp_hosted_delete(&h)==STM_OK);return 0;
+}
+
 int main(void)
 {
     TEST_ASSERT(test_dummy_transfer() == 0);
@@ -1231,6 +1422,8 @@ int main(void)
     TEST_ASSERT(test_advanced_config() == 0);
     TEST_ASSERT(test_monitor_recovery() == 0);
     TEST_ASSERT(test_receive_queue() == 0);
+    TEST_ASSERT(test_async_tasks()==0);
+    TEST_ASSERT(test_tx_queue_bounds()==0);
     puts("stm_esp_hosted tests: PASS");
     return 0;
 }
