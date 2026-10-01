@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define STM_ESP_HOSTED_VERSION       "0.5.0"
+#define STM_ESP_HOSTED_VERSION       "0.6.0"
 #define ESP_HOSTED_FRAME_SIZE        1600U
 #define ESP_HOSTED_FRAME_HEADER_SIZE  12U
 #define ESP_HOSTED_FRAME_CHECKSUM_OFFSET 6U
@@ -233,6 +233,14 @@ typedef enum {
     EH_WIFI_MODE_APSTA = 3,
 } eh_wifi_mode_t;
 typedef enum { EH_WIFI_IF_STA = 0, EH_WIFI_IF_AP = 1 } eh_wifi_if_t;
+/** @brief 2.4 GHz 协议标志；仅接受 B、BG、BGN 三种组合。 */
+#define EH_WIFI_PROTOCOL_11B 0x01U
+#define EH_WIFI_PROTOCOL_11G 0x02U
+#define EH_WIFI_PROTOCOL_11N 0x04U
+typedef enum {
+    EH_WIFI_BW_HT20 = 1,
+    EH_WIFI_BW_HT40 = 2,
+} eh_wifi_bandwidth_t;
 /** Secondary-channel position reported by the coprocessor. */
 typedef enum {
     EH_WIFI_SECOND_CHAN_NONE = 0,
@@ -342,6 +350,20 @@ stm_err_t eh_wifi_get_config(esp_hosted_handle_t handle, eh_wifi_if_t iface,
 /** CP power-save mode: no implicit change to its default setting. */
 stm_err_t eh_wifi_set_ps(esp_hosted_handle_t handle, eh_wifi_ps_t mode, uint32_t timeout_ms);
 stm_err_t eh_wifi_get_ps(esp_hosted_handle_t handle, eh_wifi_ps_t *mode, uint32_t timeout_ms);
+/** @brief 设置已启用 STA/AP 接口的协议组合；要求 Wi-Fi 初始化，不要求关联。
+ * 不自动调整带宽；移除 11n 前应先设置 HT20。timeout_ms 必须非零。 */
+stm_err_t eh_wifi_set_protocol(esp_hosted_handle_t handle, eh_wifi_if_t iface,
+                              uint8_t bitmap, uint32_t timeout_ms);
+/** @brief 查询 CP 协议配置；任何失败保持输出不变。 */
+stm_err_t eh_wifi_get_protocol(esp_hosted_handle_t handle, eh_wifi_if_t iface,
+                              uint8_t *bitmap, uint32_t timeout_ms);
+/** @brief 设置接口配置带宽；CP 校验 HT40/11n 兼容性，不额外查询或修改协议。
+ * 要求 Wi-Fi 初始化且模式启用此接口，不要求关联；timeout_ms 必须非零。 */
+stm_err_t eh_wifi_set_bandwidth(esp_hosted_handle_t handle, eh_wifi_if_t iface,
+                               eh_wifi_bandwidth_t bandwidth, uint32_t timeout_ms);
+/** @brief 查询配置带宽，实际通信带宽由协商决定；任何失败保持输出不变。 */
+stm_err_t eh_wifi_get_bandwidth(esp_hosted_handle_t handle, eh_wifi_if_t iface,
+                               eh_wifi_bandwidth_t *bandwidth, uint32_t timeout_ms);
 stm_err_t eh_wifi_start(esp_hosted_handle_t handle, uint32_t timeout_ms);
 stm_err_t eh_wifi_stop(esp_hosted_handle_t handle, uint32_t timeout_ms);
 stm_err_t eh_wifi_connect(esp_hosted_handle_t handle, uint32_t timeout_ms);

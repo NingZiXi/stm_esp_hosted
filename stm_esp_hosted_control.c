@@ -482,6 +482,83 @@ stm_err_t eh_wifi_get_ps(esp_hosted_handle_t h, eh_wifi_ps_t *mode, uint32_t tim
     return err;
 }
 
+static int radio_iface_valid(eh_wifi_if_t iface)
+{
+    return iface == EH_WIFI_IF_STA || iface == EH_WIFI_IF_AP;
+}
+static int radio_iface_enabled(esp_hosted_handle_t h, eh_wifi_if_t iface)
+{
+    return h->wifi_initialized && (h->wifi_mode &
+        (iface == EH_WIFI_IF_STA ? EH_WIFI_MODE_STA : EH_WIFI_MODE_AP));
+}
+static int protocol_valid(uint64_t bitmap)
+{
+    return bitmap == EH_WIFI_PROTOCOL_11B ||
+        bitmap == (EH_WIFI_PROTOCOL_11B | EH_WIFI_PROTOCOL_11G) ||
+        bitmap == (EH_WIFI_PROTOCOL_11B | EH_WIFI_PROTOCOL_11G | EH_WIFI_PROTOCOL_11N);
+}
+static stm_err_t radio_set(esp_hosted_handle_t h, eh_wifi_if_t iface,
+                           uint32_t id, uint32_t value, uint32_t timeout_ms)
+{
+    uint8_t body[16];
+    size_t n = put_num(body, 1U, (uint32_t)iface);
+    n += put_num(body + n, 2U, value);
+    return request(h, id, body, n, NULL, NULL, timeout_ms);
+}
+static stm_err_t radio_get(esp_hosted_handle_t h, eh_wifi_if_t iface,
+                           uint32_t id, uint64_t *value, uint32_t timeout_ms)
+{
+    uint8_t body[8], response[32]; size_t len = sizeof(response);
+    size_t n = put_num(body, 1U, (uint32_t)iface);
+    stm_err_t err = request(h, id, body, n, response, &len, timeout_ms);
+    if (err != STM_OK) { return err; }
+    const uint8_t *unused = NULL; size_t size = 0U;
+    return field(response, len, 2U, 0U, &unused, &size, value) == 1 ? STM_OK : STM_ERR_VERIFY;
+}
+stm_err_t eh_wifi_set_protocol(esp_hosted_handle_t h, eh_wifi_if_t iface,
+                              uint8_t bitmap, uint32_t timeout_ms)
+{
+    if (!h || !radio_iface_valid(iface) || !timeout_ms || !protocol_valid(bitmap)) {
+        return STM_ERR_INVALID_ARG;
+    }
+    if (!radio_iface_enabled(h, iface)) { return STM_ERR_INVALID_STATE; }
+    return radio_set(h, iface, 297U, bitmap, timeout_ms);
+}
+stm_err_t eh_wifi_get_protocol(esp_hosted_handle_t h, eh_wifi_if_t iface,
+                              uint8_t *bitmap, uint32_t timeout_ms)
+{
+    if (!h || !radio_iface_valid(iface) || !bitmap || !timeout_ms) { return STM_ERR_INVALID_ARG; }
+    if (!radio_iface_enabled(h, iface)) { return STM_ERR_INVALID_STATE; }
+    uint64_t value = 0U;
+    stm_err_t err = radio_get(h, iface, 298U, &value, timeout_ms);
+    if (err != STM_OK) { return err; }
+    if (!protocol_valid(value)) { return STM_ERR_VERIFY; }
+    *bitmap = (uint8_t)value;
+    return STM_OK;
+}
+stm_err_t eh_wifi_set_bandwidth(esp_hosted_handle_t h, eh_wifi_if_t iface,
+                               eh_wifi_bandwidth_t bandwidth, uint32_t timeout_ms)
+{
+    if (!h || !radio_iface_valid(iface) || !timeout_ms ||
+        (bandwidth != EH_WIFI_BW_HT20 && bandwidth != EH_WIFI_BW_HT40)) {
+        return STM_ERR_INVALID_ARG;
+    }
+    if (!radio_iface_enabled(h, iface)) { return STM_ERR_INVALID_STATE; }
+    return radio_set(h, iface, 299U, (uint32_t)bandwidth, timeout_ms);
+}
+stm_err_t eh_wifi_get_bandwidth(esp_hosted_handle_t h, eh_wifi_if_t iface,
+                               eh_wifi_bandwidth_t *bandwidth, uint32_t timeout_ms)
+{
+    if (!h || !radio_iface_valid(iface) || !bandwidth || !timeout_ms) { return STM_ERR_INVALID_ARG; }
+    if (!radio_iface_enabled(h, iface)) { return STM_ERR_INVALID_STATE; }
+    uint64_t value = 0U;
+    stm_err_t err = radio_get(h, iface, 300U, &value, timeout_ms);
+    if (err != STM_OK) { return err; }
+    if (value != EH_WIFI_BW_HT20 && value != EH_WIFI_BW_HT40) { return STM_ERR_VERIFY; }
+    *bandwidth = (eh_wifi_bandwidth_t)value;
+    return STM_OK;
+}
+
 /** Decode only the documented, credential-free subset of wifi_config. */
 static stm_err_t parse_config_info(const uint8_t *response, size_t len, eh_wifi_if_t iface,
                                    eh_wifi_config_info_t *out)

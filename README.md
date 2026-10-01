@@ -66,6 +66,34 @@ if (eh_wifi_get_mode(host, &mode, 5000U) == STM_OK && mode == EH_WIFI_MODE_STA &
 
 凭据存放在应用的本地忽略配置中，不要写入组件源码、公开仓库或日志。STA/AP 一帧最长 1514 字节；短于 Ethernet 头部或超过上限的帧会被拒绝。当前 API 不支持并发调用，也不要在组件回调内重入发送或控制 API。AP 演示已通过单客户端 HTTP/TCP 和手机 UDP 回显；多个客户端并发和长期运行尚未覆盖。
 
+## 协议与带宽配置
+
+`eh_wifi_set_protocol()` / `eh_wifi_get_protocol()` 对应 RPC 297/298，`eh_wifi_set_bandwidth()` / `eh_wifi_get_bandwidth()` 对应 RPC 299/300。四个接口均接收 `EH_WIFI_IF_STA` 或 `EH_WIFI_IF_AP` 和非零 `timeout_ms`，要求已完成 Wi-Fi 初始化且当前模式启用指定接口，不要求 STA 关联或 AP 已启动。在 AP+STA 模式中两接口可独立配置。
+
+协议标志为 `EH_WIFI_PROTOCOL_11B=0x01`、`EH_WIFI_PROTOCOL_11G=0x02`、`EH_WIFI_PROTOCOL_11N=0x04`，只接受 B、BG、BGN 三种组合。带宽为 `EH_WIFI_BW_HT20=1`、`EH_WIFI_BW_HT40=2`；HT40 需要 11n。组件不为带宽设置额外查询协议，不自动调整组合、降级或恢复配置。无效参数返回 `STM_ERR_INVALID_ARG`，接口未启用返回 `STM_ERR_INVALID_STATE`，CP 拒绝返回 `STM_ERR_IO`；可用 `esp_hosted_get_info()` 查看最近 RPC 的 CP 状态。查询缺字段、重复字段、类型或数值错误返回 `STM_ERR_VERIFY`，超时返回 `STM_ERR_TIMEOUT`，超过查询缓冲容量返回 `STM_ERR_OUT_OF_RANGE`。查询任何失败均保持输出不变。
+
+切换配置前保存各接口协议与带宽，停止 Wi-Fi 并更新 STA/AP 的 DHCP 生命周期，再先设置 HT20、设置协议、设置目标带宽并读回确认，最后启动 Wi-Fi、连接 STA。以下函数在初始化且模式已选定、Wi-Fi 已停止后从主循环调用：
+
+```c
+static stm_err_t configure_radio(esp_hosted_handle_t host, eh_wifi_if_t iface,
+                                 uint8_t protocol, eh_wifi_bandwidth_t bandwidth)
+{
+    uint8_t actual_protocol = 0U;
+    eh_wifi_bandwidth_t actual_bandwidth = EH_WIFI_BW_HT20;
+    stm_err_t err = eh_wifi_set_bandwidth(host, iface, EH_WIFI_BW_HT20, 5000U);
+    if (err == STM_OK) { err = eh_wifi_set_protocol(host, iface, protocol, 5000U); }
+    if (err == STM_OK) { err = eh_wifi_set_bandwidth(host, iface, bandwidth, 5000U); }
+    if (err == STM_OK) { err = eh_wifi_get_protocol(host, iface, &actual_protocol, 5000U); }
+    if (err == STM_OK) { err = eh_wifi_get_bandwidth(host, iface, &actual_bandwidth, 5000U); }
+    if (err == STM_OK && (actual_protocol != protocol || actual_bandwidth != bandwidth)) {
+        err = STM_ERR_VERIFY;
+    }
+    return err;
+}
+```
+
+从 BGN/HT40 切换到 B 或 BG 前同样先设置 HT20；恢复保存的配置也采用此顺序，并重新确认 DHCP、DNS 和应用通信。事件回调只标记任务，不执行同步 RPC。带宽读回表示配置值，实际带宽由协商与环境决定；HT40 读回成功不证明实际以 40 MHz 通信。LR、5 GHz、11ax 与其他带宽尚未支持。
+
 ## 运行信息与 AP 客户端管理
 
 `eh_wifi_sta_get_rssi()` 在 STA 已关联时查询 dBm 信号强度；`eh_wifi_get_channel()` 在 Wi-Fi 启动后查询实际主信道及 `EH_WIFI_SECOND_CHAN_NONE/ABOVE/BELOW`。AP+STA 共用射频，AP 信道可能随 STA 关联变化。
@@ -119,3 +147,13 @@ AP+STA 实板功能测试中，首次扫描返回 3 条记录，最终固件复�
 STM32H723 与 ESP32-C3 CP 3.0.9 完成运行 RSSI、实际信道和关联 AP 信息查询；STA 十轮约 60 秒间隔的 DHCP 地址保持、真实 DNS 与 TCP/UDP 回显通过，零失败。单台手机完成三轮指定 AID 主动断开与重新接入，每轮确认离线事件、列表移除、事件/RPC AID 一致、有效 DHCP 租约、HTTP 访问和 UDP 原样回复；三轮通信恢复均在 90 秒内，AP 测试期间 STA 通信保持正常。多客户端列表及指定客户端操作由模拟测试覆盖，未进行第二台客户端实板隔离验证。
 
 模拟测试新增负 RSSI、信道枚举、列表数量/容量/空列表、多客户端、非法 MAC/AID、CP 错误、重复/畸形/超长响应、超时和迟到响应，以及 attach 前事件和过期网卡链路状态回归。组件测试、STM32 构建、聚合仓库相关编译与 CP 固件构建通过。本轮为功能验收，不增加断电或长期稳定性结论；原始日志、逐次实验记录和凭据仅保留本地。
+
+## v0.6.0 验证范围与复现
+
+STM32H723 与 ESP32-C3 CP 3.0.9 已完成 B/HT20、BG/HT20、BGN/HT20、BGN/HT40 四组 STA 配置读回、关联与 DHCP 验证；各进行十轮约 60 秒间隔的真实 DNS、TCP/UDP 回显，合计 40/40 轮，零失败或缺失。每组显式断开后均在 90 秒内重新关联、取址并恢复 DNS 和双协议通信。
+
+AP+STA 模式中，STA 固定 BGN/HT20，单台手机分别完成四组 AP 配置的接入、有效 DHCP 租约、HTTP 页面及 UDP 原样回复，同时验证 STA 通信。AP 验收中的操作超时和手机缓存旧租约的尝试未计为通过，重新测试后四组均在关联后的 90 秒内完成；结束后原始 STA/AP 配置读回和全链路恢复通过。此结论仅为配置功能验收，不新增实际 40 MHz、吞吐、长期运行或断电稳定性结论。
+
+配套 H723 演示的 `CONFIG_APP_ESP_HOSTED_RADIO_TESTS` 默认关闭；开启时要求 ESP-Hosted 和 STA 测试开启，与 INFO、PS、CLIENT、SCAN 专项测试互斥，允许 AP 示例。准备本地忽略的凭据与可达的 TCP/UDP 原样回显服务后启用此开关，主循环自动执行 STA 四组；手机 AP 组在每次准备完成后逐组启动。手机需保持连接并在每组重新访问 `http://192.168.40.1/`、向 `192.168.40.1:24681` 发新 UDP 数据。短暂切换后可能缓存旧 IP；必要时忘记测试网络再连接，必须确认新有效租约，不能只凭页面和回包判定 DHCP 通过。
+
+模拟测试覆盖 STA/AP 独立配置、三种协议与两种带宽、CP 拒绝、无效参数、缺字段、非法枚举、重复/畸形/超长响应、超时和跨事务迟到响应，以及失败时输出不变。组件测试 3/3、H723 固件、H723/H757 C/C++ 公开接口检查、聚合相关检查及现有 ESP-IDF 固件构建通过。原始日志、逐次记录和凭据仅留本地，不随发布分发。

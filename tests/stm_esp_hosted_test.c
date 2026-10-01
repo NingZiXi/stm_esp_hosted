@@ -324,6 +324,11 @@ static size_t test_put_bytes(uint8_t *data, uint32_t tag, const uint8_t *value, 
     memcpy(data + n, value, length);
     return n + length;
 }
+static unsigned radio_fault;
+static uint64_t radio_invalid_value;
+static uint8_t radio_delayed[800], radio_current[800];
+static size_t radio_delayed_len, radio_current_len;
+static uint8_t radio_protocol[2] = {7U,7U}, radio_bw[2] = {1U,1U};
 static unsigned scan_event_pending, scan_config_seen, scan_rejected, scan_result_status, ap_info_bad;
 static eh_wifi_event_t last_wifi_event;
 static unsigned wifi_event_count;
@@ -339,6 +344,12 @@ static void mock_cp(const uint8_t *tx, uint8_t *rx, uint16_t length)
                                     8U, 3U, 16U, 0x87U, 6U, 0xBAU, 0x30U, 2U, 0x12U, 0U};
     static const uint8_t mac[] = {0x02U, 0x11U, 0x22U, 0x33U, 0x44U, 0x55U};
     static const uint8_t ep[] = "RPCRsp";
+    if ((tx[0] & 0x0FU) == ESP_HOSTED_DUMMY_IF_TYPE && radio_current_len) {
+        (void)esp_hosted_encode_frame(mock_host, 3U, 0U, 2U, radio_current,
+                                     radio_current_len, rx, length);
+        radio_current_len = 0U;
+        return;
+    }
     if (!mock_stage) {
         (void)esp_hosted_encode_frame(mock_host, 5U, 0U, 1U, init,
                                        sizeof(init), rx, length);
@@ -381,7 +392,35 @@ static void mock_cp(const uint8_t *tx, uint8_t *rx, uint16_t length)
     if (runtime_fault == 7U && (id == 341U || id == 302U || id == 311U ||
         id == 312U || id == 293U)) { return; }
     if (query_fault == 7U && (id == 259U || id == 271U || id == 285U)) { return; }
-    if (id == 350U) {
+    if (id >= 297U && id <= 300U) {
+        if (radio_fault == 7U) { return; }
+        const uint8_t *cursor = rpc;
+        uint64_t key = test_read_varint(&cursor), size = test_read_varint(&cursor);
+        const uint8_t *end = cursor + size;
+        unsigned iface = 9U, value = 0U;
+        if (cursor < end && *cursor++ == 8U) { iface = (unsigned)test_read_varint(&cursor); }
+        if (cursor < end && *cursor++ == 16U) { value = (unsigned)test_read_varint(&cursor); }
+        if (key != (((uint64_t)id << 3U) | 2U) || iface > 1U || cursor != end) {
+            b += test_put_num(body+b,1U,0x102U);
+        } else if (radio_fault == 1U || (id == 299U && value == 2U && !(radio_protocol[iface] & 4U))) {
+            b += test_put_num(body+b,1U,0x102U);
+        } else if (id == 297U || id == 299U) {
+            if (id == 297U) { radio_protocol[iface]=(uint8_t)value; }
+            else { radio_bw[iface]=(uint8_t)value; }
+        } else if (radio_fault != 2U) {
+            value = id == 298U ? radio_protocol[iface] : radio_bw[iface];
+            if (radio_fault == 3U) { value=0U; }
+            if (radio_fault == 5U) { b += test_put_bytes(body+b,2U,(const uint8_t *)"x",1U); }
+            else if (radio_fault == 13U) { b += test_put_num(body+b,2U,radio_invalid_value); }
+            else { b += test_put_num(body+b,2U,value); }
+            if (radio_fault == 4U) { b += test_put_num(body+b,2U,value); }
+        }
+        if (radio_fault == 6U) { body[b++]=0x80U; }
+        if (radio_fault == 9U) { uint8_t pad[64]={0}; b+=test_put_bytes(body+b,20U,pad,sizeof(pad)); }
+        if (radio_fault == 10U) { body[b++]=0xA5U;body[b++]=1U;memset(body+b,0,4U);b+=4U; }
+        if (radio_fault == 11U) { b+=test_put_num(body+b,1U,0U);b+=test_put_num(body+b,1U,0U); }
+        if (radio_fault == 12U) { b+=test_put_bytes(body+b,1U,(const uint8_t *)"x",1U); }
+    } else if (id == 350U) {
         b += test_put_num(body + b, 2U, 3U);
         /* protobuf omits the zero-valued minor field on the real CP. */
         b += test_put_num(body + b, 4U, 9U);
@@ -547,12 +586,23 @@ static void mock_cp(const uint8_t *tx, uint8_t *rx, uint16_t length)
     else if (id == 283U) { mock_seen |= 256U; }
     n += test_put_num(payload + n, 1U, 2U);
     n += test_put_num(payload + n, 2U, id + 256U);
-    n += test_put_num(payload + n, 3U, query_fault == 8U || runtime_fault == 8U ? uid - 1U : uid);
+    n += test_put_num(payload + n, 3U, query_fault == 8U || runtime_fault == 8U || radio_fault == 8U ? uid - 1U : uid);
     n += test_put_bytes(payload + n, id + 256U, body, b);
     wire[w++] = 1U; wire[w++] = sizeof(ep) - 1U; wire[w++] = 0U;
     memcpy(wire + w, ep, sizeof(ep) - 1U); w += sizeof(ep) - 1U;
     wire[w++] = 2U; wire[w++] = (uint8_t)n; wire[w++] = (uint8_t)(n >> 8U);
     memcpy(wire + w, payload, n); w += n;
+    if (id >= 297U && id <= 300U && radio_fault == 14U) {
+        memcpy(radio_delayed, wire, w); radio_delayed_len = w;
+        return; /* Deliver this transaction only after its caller has timed out. */
+    }
+    if (id >= 297U && id <= 300U && radio_delayed_len) {
+        memcpy(radio_current, wire, w); radio_current_len = w;
+        (void)esp_hosted_encode_frame(mock_host, 3U, 0U, 2U, radio_delayed,
+                                     radio_delayed_len, rx, length);
+        radio_delayed_len = 0U;
+        return;
+    }
     (void)esp_hosted_encode_frame(mock_host, 3U, 0U, 2U, wire, w, rx, length);
 }
 static int test_successful_rpc_sequence(void)
@@ -847,6 +897,93 @@ static int test_runtime_queries(void)
     return 0;
 }
 
+static int test_radio_config(void)
+{
+    static uint8_t tx[1600] __attribute__((aligned(32))), rx[1600] __attribute__((aligned(32)));
+    esp_hosted_handle_t h=make_handle(tx,rx,ESP_HOSTED_DUMMY_IF_TYPE);
+    TEST_ASSERT(h);
+    mock_host=h;mock_stage=1U;mock_connect_event=mock_disconnect_event=scan_event_pending=0U;
+    query_fault=runtime_fault=radio_fault=0U;
+    h->negotiated=1U;h->wifi_initialized=1U;h->wifi_mode=EH_WIFI_MODE_APSTA;
+    test_hal_set_frame_callback(mock_cp);
+    uint8_t bitmap=99U;eh_wifi_bandwidth_t bw=(eh_wifi_bandwidth_t)99;
+    /* Configuring a stopped, unassociated interface is supported. */
+    const uint8_t masks[]={1U,3U,7U};
+    for(unsigned iface=0;iface<2;++iface) {
+        for(unsigned i=0;i<3;++i) {
+            TEST_ASSERT(eh_wifi_set_bandwidth(h,(eh_wifi_if_t)iface,EH_WIFI_BW_HT20,30U)==STM_OK);
+            TEST_ASSERT(eh_wifi_set_protocol(h,(eh_wifi_if_t)iface,masks[i],30U)==STM_OK);
+            TEST_ASSERT(eh_wifi_get_protocol(h,(eh_wifi_if_t)iface,&bitmap,30U)==STM_OK && bitmap==masks[i]);
+            TEST_ASSERT(eh_wifi_get_bandwidth(h,(eh_wifi_if_t)iface,&bw,30U)==STM_OK && bw==EH_WIFI_BW_HT20);
+        }
+        unsigned before=mock_requests;
+        TEST_ASSERT(eh_wifi_set_bandwidth(h,(eh_wifi_if_t)iface,EH_WIFI_BW_HT40,30U)==STM_OK);
+        TEST_ASSERT(mock_requests==before+1U); /* No implicit protocol read or set. */
+        TEST_ASSERT(eh_wifi_get_bandwidth(h,(eh_wifi_if_t)iface,&bw,30U)==STM_OK && bw==EH_WIFI_BW_HT40);
+    }
+    TEST_ASSERT(eh_wifi_set_bandwidth(h,EH_WIFI_IF_AP,EH_WIFI_BW_HT20,30U)==STM_OK);
+    TEST_ASSERT(eh_wifi_set_protocol(h,EH_WIFI_IF_AP,1U,30U)==STM_OK);
+    TEST_ASSERT(eh_wifi_get_protocol(h,EH_WIFI_IF_STA,&bitmap,30U)==STM_OK && bitmap==7U);
+    TEST_ASSERT(eh_wifi_get_bandwidth(h,EH_WIFI_IF_STA,&bw,30U)==STM_OK && bw==EH_WIFI_BW_HT40);
+    TEST_ASSERT(eh_wifi_set_bandwidth(h,EH_WIFI_IF_AP,EH_WIFI_BW_HT40,30U)==STM_ERR_IO);
+    for(unsigned f=1;f<=12;++f) {
+        radio_fault=f;bitmap=99U;bw=(eh_wifi_bandwidth_t)99;radio_bw[0]=2U;
+        stm_err_t expected=f==1U ? STM_ERR_IO : (f==7U || f==8U) ? STM_ERR_TIMEOUT : f==9U ? STM_ERR_OUT_OF_RANGE : f==10U ? STM_OK : STM_ERR_VERIFY;
+        TEST_ASSERT(eh_wifi_get_protocol(h,EH_WIFI_IF_STA,&bitmap,20U)==expected);
+        TEST_ASSERT(eh_wifi_get_bandwidth(h,EH_WIFI_IF_STA,&bw,20U)==expected);
+        TEST_ASSERT(bitmap==(f==10U?7U:99U) && bw==(f==10U?EH_WIFI_BW_HT40:(eh_wifi_bandwidth_t)99));
+        if(f==1U || f==7U || f==8U || f==11U || f==12U || f==6U) {
+            TEST_ASSERT(eh_wifi_set_protocol(h,EH_WIFI_IF_STA,7U,20U)==expected);
+            TEST_ASSERT(eh_wifi_set_bandwidth(h,EH_WIFI_IF_STA,EH_WIFI_BW_HT20,20U)==expected);
+        }
+    }
+    radio_fault=0U;
+    TEST_ASSERT(eh_wifi_get_protocol(h,EH_WIFI_IF_STA,&bitmap,30U)==STM_OK && bitmap==7U);
+    const uint64_t bad_values[]={2U,4U,5U,6U,8U,255U,263U,UINT64_MAX};
+    radio_fault=13U;
+    for(unsigned i=0;i<sizeof(bad_values)/sizeof(bad_values[0]);++i) {
+        radio_invalid_value=bad_values[i];bitmap=99U;
+        TEST_ASSERT(eh_wifi_get_protocol(h,EH_WIFI_IF_STA,&bitmap,20U)==STM_ERR_VERIFY);
+        TEST_ASSERT(bitmap==99U);
+    }
+    const uint64_t bad_bandwidths[]={3U,257U,UINT64_MAX};
+    for(unsigned i=0;i<sizeof(bad_bandwidths)/sizeof(bad_bandwidths[0]);++i) {
+        radio_invalid_value=bad_bandwidths[i];bw=(eh_wifi_bandwidth_t)99;
+        TEST_ASSERT(eh_wifi_get_bandwidth(h,EH_WIFI_IF_STA,&bw,20U)==STM_ERR_VERIFY);
+        TEST_ASSERT(bw==(eh_wifi_bandwidth_t)99);
+    }
+    radio_fault=14U;bitmap=99U;radio_protocol[0]=1U;
+    TEST_ASSERT(eh_wifi_get_protocol(h,EH_WIFI_IF_STA,&bitmap,20U)==STM_ERR_TIMEOUT && bitmap==99U);
+    radio_fault=0U;radio_protocol[0]=7U;
+    TEST_ASSERT(eh_wifi_get_protocol(h,EH_WIFI_IF_STA,&bitmap,30U)==STM_OK && bitmap==7U);
+    TEST_ASSERT(!radio_delayed_len && !radio_current_len);
+    for(unsigned bad=0;bad<256;++bad) {
+        if(bad==1U || bad==3U || bad==7U)continue;
+        TEST_ASSERT(eh_wifi_set_protocol(h,EH_WIFI_IF_STA,(uint8_t)bad,20U)==STM_ERR_INVALID_ARG);
+    }
+    unsigned before=mock_requests;
+    TEST_ASSERT(eh_wifi_set_protocol(NULL,EH_WIFI_IF_STA,7U,20U)==STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_set_protocol(h,(eh_wifi_if_t)-1,7U,20U)==STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_get_protocol(h,EH_WIFI_IF_AP,NULL,20U)==STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_get_protocol(h,EH_WIFI_IF_AP,&bitmap,0U)==STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_get_bandwidth(NULL,EH_WIFI_IF_STA,&bw,20U)==STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_get_bandwidth(h,(eh_wifi_if_t)2,&bw,20U)==STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_get_bandwidth(h,EH_WIFI_IF_AP,NULL,20U)==STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_set_bandwidth(h,EH_WIFI_IF_AP,(eh_wifi_bandwidth_t)-1,20U)==STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_set_bandwidth(h,EH_WIFI_IF_AP,(eh_wifi_bandwidth_t)3,20U)==STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_set_bandwidth(h,EH_WIFI_IF_AP,EH_WIFI_BW_HT20,0U)==STM_ERR_INVALID_ARG);
+    h->wifi_initialized=0U;
+    TEST_ASSERT(eh_wifi_set_protocol(h,EH_WIFI_IF_STA,7U,20U)==STM_ERR_INVALID_STATE);
+    TEST_ASSERT(eh_wifi_get_bandwidth(h,EH_WIFI_IF_AP,&bw,20U)==STM_ERR_INVALID_STATE);
+    h->wifi_initialized=1U;h->wifi_mode=EH_WIFI_MODE_STA;
+    TEST_ASSERT(eh_wifi_get_protocol(h,EH_WIFI_IF_AP,&bitmap,20U)==STM_ERR_INVALID_STATE);
+    TEST_ASSERT(eh_wifi_set_bandwidth(h,EH_WIFI_IF_AP,EH_WIFI_BW_HT20,20U)==STM_ERR_INVALID_STATE);
+    TEST_ASSERT(mock_requests==before);
+    test_hal_set_frame_callback(NULL);
+    TEST_ASSERT(esp_hosted_delete(&h)==STM_OK);
+    return 0;
+}
+
 int main(void)
 {
     TEST_ASSERT(test_dummy_transfer() == 0);
@@ -861,6 +998,7 @@ int main(void)
     TEST_ASSERT(test_successful_rpc_sequence() == 0);
     TEST_ASSERT(test_reconnect_policy() == 0);
     TEST_ASSERT(test_runtime_queries() == 0);
+    TEST_ASSERT(test_radio_config() == 0);
     puts("stm_esp_hosted tests: PASS");
     return 0;
 }
