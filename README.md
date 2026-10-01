@@ -94,6 +94,71 @@ static stm_err_t configure_radio(esp_hosted_handle_t host, eh_wifi_if_t iface,
 
 从 BGN/HT40 切换到 B 或 BG 前同样先设置 HT20；恢复保存的配置也采用此顺序，并重新确认 DHCP、DNS 和应用通信。事件回调只标记任务，不执行同步 RPC。带宽读回表示配置值，实际带宽由协商与环境决定；HT40 读回成功不证明实际以 40 MHz 通信。LR、5 GHz、11ax 与其他带宽尚未支持。
 
+## 异常诊断与传输恢复
+
+`esp_hosted_set_monitor()` 用 RPC 277 配置 CP 心跳，事件 770 刷新本地计时；默认关闭。CP 3.0.9 支持 10 至 3600 秒周期，启用时本地超时必须大于两个周期且不超过 `INT32_MAX` 毫秒。示例采用 10 秒周期、35 秒超时：
+
+```c
+esp_hosted_monitor_config_t monitor = {
+    .enabled = 1U, .interval_s = 10U, .timeout_ms = 35000U,
+};
+stm_err_t err = esp_hosted_set_monitor(host, &monitor, 5000U);
+```
+
+`esp_hosted_get_diagnostics()` 不发 RPC，返回本地传输状态、会话代次、最近故障及 HAL 毫秒时间、最近失败 RPC/CP 状态和累计计数。SPI 失败、帧/校验失败、RPC 超时、迟到响应、心跳超时及恢复成功/失败计数在句柄生命周期内饱和累计；恢复不清零，正常成功请求不覆盖最近故障。`READY` 只表示 INIT、CP 3.0.9 核对和已启用的心跳配置完成，Wi-Fi 与 IP 仍须另行恢复。
+
+已就绪时收到有效新 INIT 或心跳超时会使旧会话失效并进入 `FAULT`。初始化/恢复中重复 INIT 合并处理。单次 RPC 超时、CP 拒绝、坏帧或 Data Ready 空闲不单独触发复位；心跳超时仅说明 CP 通路失联。失效会取消未完成 RPC，清除 Wi-Fi 初始化、连接、扫描、自动重连执行状态和临时数据，通知 STA/AP 链路下线。UID 不因恢复而重新从零分配，旧响应不得完成新请求；`esp_hosted_reset()` 同样清除旧会话状态。
+
+`esp_hosted_recover_begin(host, timeout_ms)` 只启动异步恢复，不在入口等待启动完成。后续 `esp_hosted_poll()` 推进 EN 拉低 10 毫秒、启动等待、INIT 能力回包、版本核对及心跳重新配置；总超时覆盖全部步骤。同步 RPC 与恢复事务互斥，恢复中返回 `STM_ERR_INVALID_STATE`，组件回调中重入返回 `STM_ERR_INVALID_CONTEXT`。同步请求的超时也覆盖整个请求。
+
+应用从主循环启动恢复，持续处理 lwIP 定时器，并检查诊断状态。到 `READY` 后逐步重放 Wi-Fi 初始化、模式、应用凭据、协议/带宽、国家策略、省电模式，再启动 Wi-Fi、设置功率、连接和取址；组件不保存密码，不自行复位或重放这些配置。例如：
+
+```c
+/* 在主循环的恢复入口调用一次。 */
+stm_err_t err = esp_hosted_recover_begin(host, 10000U);
+/* 后续每轮继续 esp_hosted_poll(host)、sys_check_timeouts()。 */
+esp_hosted_diagnostics_t diagnostics;
+if (esp_hosted_get_diagnostics(host, &diagnostics) == STM_OK &&
+    diagnostics.state == ESP_HOSTED_STATE_READY) {
+    /* 由应用状态机执行上述配置重放，再验证 DHCP/DNS/通信。 */
+}
+```
+
+链路失效后调用 STA/AP 生命周期更新：STA 停止 DHCP、清除旧地址及 ARP；AP 停止 DHCP、清空租约及 ARP，同时保留静态地址和网卡对象。应用还须取消旧 DNS/回显任务、关闭对应 TCP/UDP 会话，恢复后建立新探针。配套演示的每次全链路恢复限时 90 秒，传输恢复每次 10 秒，失败间隔 5 秒、最多三次，超限明确停止。
+
+## 国家策略、共享信道与功率
+
+| 接口 | RPC | 前置条件与结果 |
+| --- | --- | --- |
+| `eh_wifi_set_country_code()` | 334 | Wi-Fi 已初始化；两字符大写国家码或世界安全模式 `01`，802.11d 参数为 0/1 |
+| `eh_wifi_get_country_code()` | 335 | Wi-Fi 已初始化；输出 `char[4]`，容纳两字符代码、可选环境字符和终止符 |
+| `eh_wifi_get_country()` | 304 | Wi-Fi 已初始化；返回代码、2.4 GHz 起始信道/数量、最大功率和 AUTO/MANUAL 策略 |
+| `eh_wifi_set_channel()` | 301 | Wi-Fi 已启动；主信道 1..14，次信道使用现有 NONE/ABOVE/BELOW 枚举 |
+| `eh_wifi_set_max_tx_power()` | 275 | Wi-Fi 已启动；请求范围 8..84，单位 0.25 dBm |
+| `eh_wifi_get_max_tx_power()` | 276 | Wi-Fi 已启动；读回 CP 实际配置，单位 0.25 dBm |
+
+这些同步接口均接收非零 `timeout_ms`。国家码的最终有效性、当地可用信道及组合由 CP 判定；国家配置可能写入 CP Flash，不应在周期探针中反复设置。当前 CP 设置处理只复制两字符代码，因此设置接口不接受第三个环境字符；查询保留 CP 返回的合法环境字符。`eh_wifi_country_info_t.max_tx_power` 的单位是整 dBm，与功率接口的 0.25 dBm 区分。
+
+`ieee80211d_enabled=0` 为固定 MANUAL 策略，1 为 AUTO。AUTO 关联路由器后可能采用其广播的有效国家信息；保存原配置前应先断开 STA，查询未关联时的国家策略，恢复时分别核对未关联配置和关联后的有效信息。
+
+信道和最大发射功率属于共享射频，没有 STA/AP 参数。设置信道拒绝已知扫描、连接进行中和 STA 已关联状态；应用还应保证切换时无 AP 客户端，不暗中断开手机。AP+STA 关联路由器后 AP 跟随 STA 实际信道，不承诺两者独立信道，也不自动改带宽或重新连接。
+
+功率设置可能按 CP 档位量化，读回无需与请求逐值相等。组件不自动提升功率；应用必须结合国家上限选值。RPC 276 的状态字段为字段 2，已单独处理。设置成功仅表示 CP 接受配置；查询失败保持输出不变，缺字段、重复字段、错误类型/数值或畸形响应按现有错误体系返回。
+
+```c
+/* Wi-Fi 已初始化，STA 未关联；国家策略无需周期重复设置。 */
+stm_err_t err = eh_wifi_set_country_code(host, "CN", 0U, 5000U);
+eh_wifi_country_info_t country;
+if (err == STM_OK) { err = eh_wifi_get_country(host, &country, 5000U); }
+/* Wi-Fi 启动后、无扫描/连接任务且无 AP 客户端时设置纯 AP 信道。 */
+if (err == STM_OK) { err = eh_wifi_set_channel(host, 6U, EH_WIFI_SECOND_CHAN_NONE, 5000U); }
+int8_t actual_power;
+if (err == STM_OK && country.max_tx_power >= 11) {
+    err = eh_wifi_set_max_tx_power(host, 44, 5000U); /* 11 dBm 上限请求。 */
+    if (err == STM_OK) { err = eh_wifi_get_max_tx_power(host, &actual_power, 5000U); }
+}
+```
+
 ## 运行信息与 AP 客户端管理
 
 `eh_wifi_sta_get_rssi()` 在 STA 已关联时查询 dBm 信号强度；`eh_wifi_get_channel()` 在 Wi-Fi 启动后查询实际主信道及 `EH_WIFI_SECOND_CHAN_NONE/ABOVE/BELOW`。AP+STA 共用射频，AP 信道可能随 STA 关联变化。
@@ -157,3 +222,17 @@ AP+STA 模式中，STA 固定 BGN/HT20，单台手机分别完成四组 AP 配�
 配套 H723 演示的 `CONFIG_APP_ESP_HOSTED_RADIO_TESTS` 默认关闭；开启时要求 ESP-Hosted 和 STA 测试开启，与 INFO、PS、CLIENT、SCAN 专项测试互斥，允许 AP 示例。准备本地忽略的凭据与可达的 TCP/UDP 原样回显服务后启用此开关，主循环自动执行 STA 四组；手机 AP 组在每次准备完成后逐组启动。手机需保持连接并在每组重新访问 `http://192.168.40.1/`、向 `192.168.40.1:24681` 发新 UDP 数据。短暂切换后可能缓存旧 IP；必要时忘记测试网络再连接，必须确认新有效租约，不能只凭页面和回包判定 DHCP 通过。
 
 模拟测试覆盖 STA/AP 独立配置、三种协议与两种带宽、CP 拒绝、无效参数、缺字段、非法枚举、重复/畸形/超长响应、超时和跨事务迟到响应，以及失败时输出不变。组件测试 3/3、H723 固件、H723/H757 C/C++ 公开接口检查、聚合相关检查及现有 ESP-IDF 固件构建通过。原始日志、逐次记录和凭据仅留本地，不随发布分发。
+
+## v0.7.0 验证范围与复现
+
+2026-10-01，STM32H723 + ESP32-C3 CP 3.0.9 完成十个故障注入场景：五次 CP 独立 EN 复位、三次 EN 保持低 40 秒并观察心跳超时，以及查询进行中和扫描进行中各一次复位。STM32 在注入期间保持运行，十次均在 90 秒内恢复会话、配置、DHCP、真实 DNS 和 TCP/UDP，最慢约 22.5 秒；随后十轮约 60 秒间隔正常通信通过。首次扫描注入的脉冲计时问题修复后，完整十个场景从头回归通过，故障期间中断未计为正常周期通过。
+
+CN MANUAL 与 AUTO/802.11d 各十轮 DHCP 保持、真实 DNS、TCP/UDP，20/20 通过。功率请求 20、44、60（5、11、15 dBm）分别设置并读回，各十轮同样检查，30/30 通过；每档显式断线后均在 90 秒内重新取址和恢复通信。原未关联国家策略、协议、带宽、省电及功率保存、重放和恢复核对通过。
+
+单台手机在纯 AP BGN/HT20 下完成信道 1、6、11 的读回、新有效 DHCP 租约、HTTP 页面和 UDP 原样回复，均在关联后 90 秒内完成。AP+STA 共享信道及同时通信通过；一次 AP+STA 下 CP 独立复位后约 22 秒恢复 STA 全链路，手机重新取得租约并恢复 HTTP/UDP。三个功率档位下手机与 STA 同时通信、结束后的原配置读回与两端复测均通过。准备延迟或手机缓存旧 IP 的超时尝试未计为通过，重新准备并取得新租约后重测通过。
+
+复现时使用配套演示默认关闭的 `CONFIG_APP_ESP_HOSTED_RECOVERY_TESTS`、`CONFIG_APP_ESP_HOSTED_REGION_TESTS`、`CONFIG_APP_ESP_HOSTED_POWER_TESTS`，每次仅开一项；要求 ESP-Hosted、STA 开启，与其他专项测试互斥，手机阶段还需 AP 示例。准备忽略的本地凭据、真实 DNS 及电脑 TCP/UDP 原样回显服务，先运行自动阶段，再在手机准备完成后逐组启动。手机保持连接，切换后必要时忘记热点以获取新租约，重新访问 HTTP 并发送新 UDP；仅凭旧 IP 下通信成功不足以通过 DHCP 验收。故障注入入口只在本地恢复测试构建启用，正式演示关闭专项测试。
+
+自动检查覆盖重复 INIT、无数据、心跳启停/超时、计时回绕、事务取消/互斥、迟到响应、回调重入、恢复成功/失败、诊断饱和计数、STA 地址/ARP 清理、AP 租约清理和重复启停，以及国家/信道/功率参数边界、默认值省略、错误状态字段、畸形/超长响应和失败时输出不变。组件测试 3/3、H723 正常/专项固件、H723/H757 C/C++ 接口及聚合编译、现有 ESP-IDF CP 固件构建通过。
+
+本轮仅覆盖所列异常恢复与功能配置；功率读回和通信不代表实际射频输出测量，HT40 仍只是配置值。不新增长期运行、吞吐或整板断电稳定性结论。原始日志、故障注入和逐次记录及凭据只留本地。

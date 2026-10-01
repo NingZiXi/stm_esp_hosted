@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define STM_ESP_HOSTED_VERSION       "0.6.0"
+#define STM_ESP_HOSTED_VERSION       "0.7.0"
 #define ESP_HOSTED_FRAME_SIZE        1600U
 #define ESP_HOSTED_FRAME_HEADER_SIZE  12U
 #define ESP_HOSTED_FRAME_CHECKSUM_OFFSET 6U
@@ -95,6 +95,52 @@ typedef struct {
     uint8_t last_rpc_status_present;
     uint8_t ready;
 } esp_hosted_info_t;
+
+/** @brief 传输就绪不表示 Wi-Fi 已关联或 DHCP 已取址。 */
+typedef enum {
+    ESP_HOSTED_STATE_NOT_READY,
+    ESP_HOSTED_STATE_READY,
+    ESP_HOSTED_STATE_FAULT,
+    ESP_HOSTED_STATE_RECOVERING,
+} esp_hosted_state_t;
+typedef enum {
+    ESP_HOSTED_FAULT_NONE,
+    ESP_HOSTED_FAULT_RESET,
+    ESP_HOSTED_FAULT_UNEXPECTED_INIT,
+    ESP_HOSTED_FAULT_HEARTBEAT_TIMEOUT,
+    ESP_HOSTED_FAULT_SPI,
+    ESP_HOSTED_FAULT_FRAME,
+    ESP_HOSTED_FAULT_RPC,
+    ESP_HOSTED_FAULT_RECOVERY,
+} esp_hosted_fault_t;
+typedef struct {
+    uint8_t enabled;
+    uint32_t interval_s; /* CP 3.0.9: 10..3600 seconds. */
+    uint32_t timeout_ms; /* Must exceed two heartbeat periods; <= INT32_MAX. */
+} esp_hosted_monitor_config_t;
+typedef struct {
+    esp_hosted_state_t state;
+    uint32_t generation;
+    esp_hosted_fault_t last_fault;
+    uint32_t last_fault_tick;
+    stm_err_t last_error;
+    uint16_t last_failed_rpc;
+    uint32_t last_cp_status;
+    uint8_t last_cp_status_present;
+    uint32_t spi_failures, checksum_failures, frame_failures;
+    uint32_t rpc_timeouts, late_responses, heartbeat_timeouts;
+    uint32_t recovery_successes, recovery_failures;
+} esp_hosted_diagnostics_t;
+
+/** @brief 配置 CP 心跳；默认关闭，不自动复位。 */
+stm_err_t esp_hosted_set_monitor(esp_hosted_handle_t handle,
+                                const esp_hosted_monitor_config_t *config,
+                                uint32_t timeout_ms);
+/** @brief 本地诊断快照；计数在句柄生命周期内饱和累计。 */
+stm_err_t esp_hosted_get_diagnostics(esp_hosted_handle_t handle,
+                                    esp_hosted_diagnostics_t *diagnostics);
+/** @brief 启动一次异步 EN/INIT/版本/心跳恢复；持续 poll，应用随后重放 Wi-Fi 配置。 */
+stm_err_t esp_hosted_recover_begin(esp_hosted_handle_t handle, uint32_t timeout_ms);
 
 /**
  * @brief 创建主机传输对象；不会初始化 SPI 外设或 GPIO 时钟。
@@ -247,6 +293,28 @@ typedef enum {
     EH_WIFI_SECOND_CHAN_ABOVE = 1,
     EH_WIFI_SECOND_CHAN_BELOW = 2,
 } eh_wifi_second_chan_t;
+typedef enum { EH_WIFI_COUNTRY_AUTO = 0, EH_WIFI_COUNTRY_MANUAL = 1 } eh_wifi_country_policy_t;
+typedef struct {
+    char country_code[4];
+    uint8_t start_channel, channel_count;
+    int8_t max_tx_power; /* Country structure uses whole dBm, not quarter dBm. */
+    eh_wifi_country_policy_t policy;
+} eh_wifi_country_info_t;
+/** @brief 国家策略可写入 CP Flash；初始化后调用，不自动重连。 */
+stm_err_t eh_wifi_set_country_code(esp_hosted_handle_t handle, const char *country_code,
+                                   uint8_t ieee80211d_enabled, uint32_t timeout_ms);
+stm_err_t eh_wifi_get_country_code(esp_hosted_handle_t handle, char country_code[4],
+                                   uint32_t timeout_ms);
+stm_err_t eh_wifi_get_country(esp_hosted_handle_t handle, eh_wifi_country_info_t *info,
+                              uint32_t timeout_ms);
+/** @brief 共享射频信道；启动后、扫描/连接/已关联之外调用。 */
+stm_err_t eh_wifi_set_channel(esp_hosted_handle_t handle, uint8_t primary,
+                              eh_wifi_second_chan_t second, uint32_t timeout_ms);
+/** @brief 最大功率上限，单位 0.25 dBm；8..84，由 CP 分档；Wi-Fi 启动后调用。 */
+stm_err_t eh_wifi_set_max_tx_power(esp_hosted_handle_t handle, int8_t power,
+                                   uint32_t timeout_ms);
+stm_err_t eh_wifi_get_max_tx_power(esp_hosted_handle_t handle, int8_t *power,
+                                   uint32_t timeout_ms);
 /** Associated AP client snapshot; IPv4 addresses belong to the DHCP/lwIP layer. */
 typedef struct {
     uint8_t mac[6];

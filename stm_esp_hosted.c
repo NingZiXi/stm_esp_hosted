@@ -127,6 +127,8 @@ stm_err_t esp_hosted_delete(esp_hosted_handle_t *handle)
         return STM_ERR_INVALID_ARG;
     }
     if (*handle != NULL) {
+        if ((*handle)->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
+        if ((*handle)->request_active || (*handle)->recovery_phase) { return STM_ERR_INVALID_STATE; }
         free(*handle);
         *handle = NULL;
     }
@@ -140,6 +142,10 @@ stm_err_t esp_hosted_reset(esp_hosted_handle_t handle,
     if (handle == NULL || low_time_ms == 0U || boot_time_ms == 0U) {
         return STM_ERR_INVALID_ARG;
     }
+    if (handle->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
+    if (handle->request_active || handle->recovery_phase) { return STM_ERR_INVALID_STATE; }
+    esp_hosted_invalidate(handle, ESP_HOSTED_FAULT_RESET, STM_ERR_CANCELLED,
+                          ESP_HOSTED_STATE_NOT_READY);
     HAL_GPIO_WritePin(handle->config.cs_port, handle->config.cs_pin, GPIO_PIN_SET);
     HAL_GPIO_WritePin(handle->config.reset_port, handle->config.reset_pin, GPIO_PIN_RESET);
     HAL_Delay(low_time_ms);
@@ -208,6 +214,7 @@ stm_err_t esp_hosted_transfer(esp_hosted_handle_t handle,
     if (handle == NULL) {
         return STM_ERR_INVALID_ARG;
     }
+    if (handle->callback_depth) { return STM_ERR_INVALID_CONTEXT; }
     if (HAL_GPIO_ReadPin(handle->config.handshake_port,
                          handle->config.handshake_pin) != GPIO_PIN_SET) {
         return STM_ERR_INVALID_STATE;
@@ -242,6 +249,8 @@ stm_err_t esp_hosted_transfer(esp_hosted_handle_t handle,
     cache_invalidate(rx_buffer, ESP_HOSTED_FRAME_SIZE);
     handle->info.last_hal_status = hal_status;
     if (hal_status != HAL_OK) {
+        esp_hosted_count(&handle->diagnostics.spi_failures);
+        esp_hosted_record_fault(handle, ESP_HOSTED_FAULT_SPI, map_hal_status(hal_status));
         return map_hal_status(hal_status);
     }
     if (rx_frame != NULL && rx_frame != rx_buffer) {

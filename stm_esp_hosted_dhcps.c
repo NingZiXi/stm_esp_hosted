@@ -2,6 +2,7 @@
 #include "lwip/ip.h"
 #include "lwip/pbuf.h"
 #include "lwip/sys.h"
+#include "lwip/etharp.h"
 #include <string.h>
 
 #define DHCP_PORT_SERVER 67U
@@ -146,6 +147,7 @@ void esp_hosted_lwip_dhcps_stop(esp_hosted_lwip_dhcps_t *s)
 {
     if (!s) { return; }
     if (s->pcb) { udp_remove(s->pcb); }
+    if (s->ap_netif) { etharp_cleanup_netif(s->ap_netif); }
     memset(s, 0, sizeof(*s));
 }
 

@@ -115,6 +115,16 @@ int main(void)
     CHECK(esp_hosted_lwip_sta_update(&a)==STM_OK && a.dhcp_running);
     n.ip_addr=(ip4_addr_t){{192,168,1,81}};
     CHECK(esp_hosted_lwip_sta_stop(&a)==STM_OK && !esp_hosted_lwip_sta_has_address(&a));
+    for(unsigned cycle=0;cycle<3;++cycle) {
+        h->connected=h->ap_up=1;
+        CHECK(esp_hosted_lwip_attach(&a)==STM_OK && esp_hosted_lwip_ap_attach(&a)==STM_OK);
+        CHECK(esp_hosted_lwip_sta_update(&a)==STM_OK);
+        n.ip_addr=(ip4_addr_t){{192,168,1,90}};
+        CHECK(esp_hosted_reset(h,10,100)==STM_OK);
+        CHECK(!netif_is_link_up(&n) && !netif_is_link_up(&ap));
+        CHECK(esp_hosted_lwip_sta_update(&a)==STM_OK && !a.dhcp_running && !n.ip_addr.byte[0]);
+        CHECK(esp_hosted_lwip_sta_update(&a)==STM_OK);
+    }
     CHECK(esp_hosted_delete(&h)==STM_OK);
     puts("lwip adapter tests: PASS");
     return 0;

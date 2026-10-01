@@ -25,6 +25,8 @@ GPIO_PinState HAL_GPIO_ReadPin(GPIO_TypeDef *port, uint16_t pin);
 void HAL_Delay(uint32_t delay_ms);
 void test_hal_inject_rx(const uint8_t *frame, uint16_t size);
 void test_hal_set_frame_callback(void (*callback)(const uint8_t *, uint8_t *, uint16_t));
+void test_hal_set_tick(uint32_t tick);
+void test_hal_set_signals(GPIO_PinState state);
 uint32_t HAL_GetTick(void);
 void SCB_CleanDCache_by_Addr(uint32_t *addr, int32_t dsize);
 void SCB_InvalidateDCache_by_Addr(uint32_t *addr, int32_t dsize);

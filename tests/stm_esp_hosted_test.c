@@ -325,6 +325,9 @@ static size_t test_put_bytes(uint8_t *data, uint32_t tag, const uint8_t *value, 
     return n + length;
 }
 static unsigned radio_fault;
+static unsigned advanced_fault;
+static unsigned reset_during_request, mock_bad_version, mock_monitor_reject;
+static uint8_t mock_power = 80U;
 static uint64_t radio_invalid_value;
 static uint8_t radio_delayed[800], radio_current[800];
 static size_t radio_delayed_len, radio_current_len;
@@ -389,10 +392,51 @@ static void mock_cp(const uint8_t *tx, uint8_t *rx, uint16_t length)
     uint8_t body[640] = {0}, payload[740] = {0}, wire[800] = {0};
     size_t b = 0U, n = 0U, w = 0U;
     ++mock_requests;
+    if(reset_during_request) {
+        reset_during_request=0U;
+        (void)esp_hosted_encode_frame(mock_host,5U,0U,1U,init,sizeof(init),rx,length);
+        return;
+    }
+    if ((id == 304U || id == 335U || id == 275U || id == 276U || id == 334U || id == 301U) && advanced_fault == 7U) { return; }
     if (runtime_fault == 7U && (id == 341U || id == 302U || id == 311U ||
         id == 312U || id == 293U)) { return; }
     if (query_fault == 7U && (id == 259U || id == 271U || id == 285U)) { return; }
-    if (id >= 297U && id <= 300U) {
+    if (id == 304U || id == 335U || id == 275U || id == 276U || id == 334U || id == 301U) {
+        uint32_t result_field = id == 276U ? 1U : 2U;
+        uint32_t status_field = id == 276U ? 2U : 1U;
+        if (advanced_fault == 1U) { b += test_put_num(body+b,status_field,0x1101U); }
+        else if (advanced_fault != 2U) {
+            if (id == 335U) {
+                const uint8_t cc[] = {'C','N',0};
+                b += test_put_bytes(body+b,2U,cc,advanced_fault == 3U ? 1U : sizeof(cc));
+            } else if (id == 304U) {
+                uint8_t country[100]; size_t c=0U;
+                c+=test_put_bytes(country+c,1U,(const uint8_t *)"CN ",3U);
+                c+=test_put_num(country+c,2U,1U);
+                c+=test_put_num(country+c,3U,advanced_fault == 3U ? 15U : 13U);
+                c+=test_put_num(country+c,4U,20U);
+                /* AUTO is deliberately omitted. */
+                b+=test_put_bytes(body+b,2U,country,c);
+            } else if (id == 276U) {
+                b+=test_put_num(body+b,1U,advanced_fault == 3U ? UINT64_MAX : mock_power);
+            } else if (id == 275U) {
+                const uint8_t *cursor = rpc;
+                (void)test_read_varint(&cursor); (void)test_read_varint(&cursor);
+                (void)test_read_varint(&cursor); mock_power=(uint8_t)test_read_varint(&cursor);
+            }
+        }
+        if (advanced_fault == 4U) {
+            if (id == 276U) { b+=test_put_num(body+b,result_field,20U); }
+            else { b+=test_put_bytes(body+b,result_field,(const uint8_t *)"CN",2U); }
+        }
+        if (advanced_fault == 5U) {
+            if (id == 276U) { b=0U; b+=test_put_bytes(body+b,result_field,(const uint8_t *)"x",1U); }
+            else { b=0U; b+=test_put_num(body+b,result_field,1U); }
+        }
+        if (advanced_fault == 6U) { body[b++]=0x80U; }
+        if (advanced_fault == 9U) { uint8_t pad[520]={0};b+=test_put_bytes(body+b,20U,pad,sizeof(pad)); }
+        if (advanced_fault == 10U) { b+=test_put_num(body+b,20U,123U); }
+    } else if (id >= 297U && id <= 300U) {
         if (radio_fault == 7U) { return; }
         const uint8_t *cursor = rpc;
         uint64_t key = test_read_varint(&cursor), size = test_read_varint(&cursor);
@@ -420,8 +464,10 @@ static void mock_cp(const uint8_t *tx, uint8_t *rx, uint16_t length)
         if (radio_fault == 10U) { body[b++]=0xA5U;body[b++]=1U;memset(body+b,0,4U);b+=4U; }
         if (radio_fault == 11U) { b+=test_put_num(body+b,1U,0U);b+=test_put_num(body+b,1U,0U); }
         if (radio_fault == 12U) { b+=test_put_bytes(body+b,1U,(const uint8_t *)"x",1U); }
+    } else if (id == 277U && mock_monitor_reject) {
+        b += test_put_num(body+b,1U,0x102U);
     } else if (id == 350U) {
-        b += test_put_num(body + b, 2U, 3U);
+        b += test_put_num(body + b, 2U, mock_bad_version ? 4U : 3U);
         /* protobuf omits the zero-valued minor field on the real CP. */
         b += test_put_num(body + b, 4U, 9U);
         mock_seen |= 1U;
@@ -586,7 +632,7 @@ static void mock_cp(const uint8_t *tx, uint8_t *rx, uint16_t length)
     else if (id == 283U) { mock_seen |= 256U; }
     n += test_put_num(payload + n, 1U, 2U);
     n += test_put_num(payload + n, 2U, id + 256U);
-    n += test_put_num(payload + n, 3U, query_fault == 8U || runtime_fault == 8U || radio_fault == 8U ? uid - 1U : uid);
+    n += test_put_num(payload + n, 3U, query_fault == 8U || runtime_fault == 8U || radio_fault == 8U || advanced_fault == 8U ? uid - 1U : uid);
     n += test_put_bytes(payload + n, id + 256U, body, b);
     wire[w++] = 1U; wire[w++] = sizeof(ep) - 1U; wire[w++] = 0U;
     memcpy(wire + w, ep, sizeof(ep) - 1U); w += sizeof(ep) - 1U;
@@ -984,6 +1030,189 @@ static int test_radio_config(void)
     return 0;
 }
 
+static int test_advanced_config(void)
+{
+    static uint8_t tx[1600] __attribute__((aligned(32))), rx[1600] __attribute__((aligned(32)));
+    esp_hosted_handle_t h=make_handle(tx,rx,ESP_HOSTED_DUMMY_IF_TYPE);
+    TEST_ASSERT(h!=NULL);
+    mock_host=h; mock_stage=0; query_fault=runtime_fault=radio_fault=advanced_fault=0;
+    mock_connect_event=mock_disconnect_event=scan_event_pending=0;
+    test_hal_set_frame_callback(mock_cp);
+    TEST_ASSERT(esp_hosted_start(h,500U)==STM_OK);
+    TEST_ASSERT(eh_wifi_init(h,100U)==STM_OK);
+    TEST_ASSERT(eh_wifi_set_mode(h,EH_WIFI_MODE_APSTA,100U)==STM_OK);
+    TEST_ASSERT(eh_wifi_start(h,100U)==STM_OK);
+    char cc[4]; eh_wifi_country_info_t info;
+    TEST_ASSERT(eh_wifi_set_country_code(h,"CN",0,100U)==STM_OK);
+    TEST_ASSERT(eh_wifi_get_country_code(h,cc,100U)==STM_OK && !strcmp(cc,"CN"));
+    TEST_ASSERT(eh_wifi_get_country(h,&info,100U)==STM_OK && !strcmp(info.country_code,"CN ") &&
+                info.start_channel==1 && info.channel_count==13 && info.policy==EH_WIFI_COUNTRY_AUTO);
+    TEST_ASSERT(eh_wifi_set_country_code(h,"01",1,100U)==STM_OK);
+    TEST_ASSERT(eh_wifi_set_country_code(h,"CNX",1,100U)==STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_set_country_code(h,"cn",1,100U)==STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_set_country_code(h,"CN",2,100U)==STM_ERR_INVALID_ARG);
+    for(unsigned ch=1;ch<=14;++ch)TEST_ASSERT(eh_wifi_set_channel(h,ch,EH_WIFI_SECOND_CHAN_NONE,100U)==STM_OK);
+    TEST_ASSERT(eh_wifi_set_channel(h,0,EH_WIFI_SECOND_CHAN_NONE,100U)==STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_set_channel(h,6,(eh_wifi_second_chan_t)-1,100U)==STM_ERR_INVALID_ARG);
+    h->connected=1;TEST_ASSERT(eh_wifi_set_channel(h,6,EH_WIFI_SECOND_CHAN_NONE,100U)==STM_ERR_INVALID_STATE);
+    h->connected=0;h->scan_pending=1;TEST_ASSERT(eh_wifi_set_channel(h,6,EH_WIFI_SECOND_CHAN_NONE,100U)==STM_ERR_INVALID_STATE);
+    h->scan_pending=0;h->connect_pending=1;TEST_ASSERT(eh_wifi_set_channel(h,6,EH_WIFI_SECOND_CHAN_NONE,100U)==STM_ERR_INVALID_STATE);h->connect_pending=0;
+    int8_t power=0;
+    for(int p=8;p<=84;++p) {
+        TEST_ASSERT(eh_wifi_set_max_tx_power(h,(int8_t)p,100U)==STM_OK);
+        TEST_ASSERT(eh_wifi_get_max_tx_power(h,&power,100U)==STM_OK && power==p);
+    }
+    for(int p=-128;p<128;++p)if(p<8 || p>84)TEST_ASSERT(eh_wifi_set_max_tx_power(h,(int8_t)p,100U)==STM_ERR_INVALID_ARG);
+    for(unsigned fault=1;fault<=10;++fault) {
+        advanced_fault=fault;power=99;memcpy(cc,"old",4);memset(&info,0xA5,sizeof(info));
+        eh_wifi_country_info_t saved=info;
+        stm_err_t expected=fault==1?STM_ERR_IO:(fault==7 || fault==8)?STM_ERR_TIMEOUT:STM_ERR_VERIFY;
+        stm_err_t e=eh_wifi_get_max_tx_power(h,&power,30U);
+        if(fault==10){TEST_ASSERT(e==STM_OK);continue;}
+        TEST_ASSERT(e==expected || (fault==9 && e==STM_ERR_OUT_OF_RANGE));TEST_ASSERT(power==99);
+        e=eh_wifi_get_country_code(h,cc,30U);
+        TEST_ASSERT(e==expected || (fault==9 && e==STM_ERR_OUT_OF_RANGE));TEST_ASSERT(!memcmp(cc,"old",4));
+        e=eh_wifi_get_country(h,&info,30U);
+        TEST_ASSERT(e==expected || (fault==9 && e==STM_ERR_OUT_OF_RANGE));TEST_ASSERT(!memcmp(&info,&saved,sizeof(info)));
+    }
+    advanced_fault=1;
+    TEST_ASSERT(eh_wifi_set_max_tx_power(h,20,100U)==STM_ERR_IO);
+    esp_hosted_diagnostics_t d;
+    TEST_ASSERT(esp_hosted_get_diagnostics(h,&d)==STM_OK && d.last_failed_rpc==275U && d.last_cp_status==0x1101U);
+    uint32_t failed_tick=d.last_fault_tick;
+    advanced_fault=0;TEST_ASSERT(eh_wifi_get_max_tx_power(h,&power,100U)==STM_OK);
+    TEST_ASSERT(esp_hosted_get_diagnostics(h,&d)==STM_OK && d.last_fault_tick==failed_tick && d.last_cp_status==0x1101U);
+    advanced_fault=2;power=99;
+    TEST_ASSERT(eh_wifi_get_max_tx_power(h,&power,100U)==STM_ERR_VERIFY && power==99);
+    TEST_ASSERT(esp_hosted_get_diagnostics(h,&d)==STM_OK && d.last_failed_rpc==276U &&
+                d.last_fault==ESP_HOSTED_FAULT_RPC && d.last_error==STM_ERR_VERIFY);
+    advanced_fault=0;
+    h->wifi_started=0;TEST_ASSERT(eh_wifi_get_max_tx_power(h,&power,100U)==STM_ERR_INVALID_STATE);
+    h->wifi_initialized=0;TEST_ASSERT(eh_wifi_get_country(h,&info,100U)==STM_ERR_INVALID_STATE);
+    TEST_ASSERT(eh_wifi_get_country_code(h,NULL,100U)==STM_ERR_INVALID_ARG);
+    TEST_ASSERT(eh_wifi_get_country(NULL,&info,100U)==STM_ERR_INVALID_ARG);
+    test_hal_set_frame_callback(NULL);TEST_ASSERT(esp_hosted_delete(&h)==STM_OK);return 0;
+}
+static stm_err_t callback_result;
+static void reentrant_link(void *user,uint8_t connected)
+{
+    (void)connected;callback_result=eh_wifi_stop((esp_hosted_handle_t)user,100U);
+}
+static int test_monitor_recovery(void)
+{
+    static uint8_t tx[1600] __attribute__((aligned(32))), rx[1600] __attribute__((aligned(32)));
+    esp_hosted_handle_t h=make_handle(tx,rx,ESP_HOSTED_DUMMY_IF_TYPE);
+    TEST_ASSERT(h!=NULL);
+    mock_host=h;mock_stage=0;query_fault=runtime_fault=radio_fault=advanced_fault=0;
+    mock_connect_event=mock_disconnect_event=scan_event_pending=0;
+    test_hal_set_frame_callback(mock_cp);
+    TEST_ASSERT(esp_hosted_start(h,500U)==STM_OK);
+    TEST_ASSERT(eh_wifi_init(h,100U)==STM_OK);
+    esp_hosted_monitor_config_t monitor={.enabled=1,.interval_s=10,.timeout_ms=35000};
+    TEST_ASSERT(esp_hosted_set_monitor(h,&monitor,100U)==STM_OK);
+    mock_monitor_reject=1;
+    esp_hosted_monitor_config_t disabled={0};
+    TEST_ASSERT(esp_hosted_set_monitor(h,&disabled,100U)==STM_ERR_IO && h->monitor.enabled);
+    mock_monitor_reject=0;
+    monitor.interval_s=9;TEST_ASSERT(esp_hosted_set_monitor(h,&monitor,100U)==STM_ERR_INVALID_ARG);
+    monitor.interval_s=10;monitor.timeout_ms=20000;TEST_ASSERT(esp_hosted_set_monitor(h,&monitor,100U)==STM_ERR_INVALID_ARG);
+    monitor.timeout_ms=35000;
+    TEST_ASSERT(esp_hosted_set_callbacks(h,NULL,reentrant_link,h)==STM_OK);
+    h->connected=h->ap_up=h->scan_pending=h->wifi_started=1;
+    h->reconnect_armed=h->reconnect_waiting=1;
+    test_hal_set_signals(GPIO_PIN_RESET);
+    test_hal_set_tick(h->heartbeat_tick+34980U);
+    TEST_ASSERT(esp_hosted_poll(h)==STM_OK && h->initialized);
+    test_hal_set_tick(h->heartbeat_tick+35000U);
+    TEST_ASSERT(esp_hosted_poll(h)==STM_OK && !h->initialized && !h->connected && !h->ap_up && !h->scan_pending && !h->reconnect_waiting);
+    TEST_ASSERT(callback_result==STM_ERR_INVALID_CONTEXT);
+    esp_hosted_diagnostics_t d;
+    TEST_ASSERT(esp_hosted_get_diagnostics(h,&d)==STM_OK && d.state==ESP_HOSTED_STATE_FAULT && d.heartbeat_timeouts==1);
+    uint32_t old_uid=h->uid;
+    test_hal_set_signals(GPIO_PIN_SET);mock_stage=0;
+    uint32_t before=HAL_GetTick();TEST_ASSERT(esp_hosted_recover_begin(h,1000U)==STM_OK);
+    TEST_ASSERT(HAL_GetTick()-before<10U);
+    TEST_ASSERT(esp_hosted_recover_begin(h,1000U)==STM_ERR_INVALID_STATE);
+    TEST_ASSERT(eh_wifi_init(h,100U)==STM_ERR_INVALID_STATE);
+    while(h->recovery_phase)TEST_ASSERT(esp_hosted_poll(h)==STM_OK);
+    TEST_ASSERT(h->initialized && h->uid>old_uid && !h->wifi_initialized && h->monitor.enabled);
+    TEST_ASSERT(esp_hosted_get_diagnostics(h,&d)==STM_OK && d.state==ESP_HOSTED_STATE_READY && d.recovery_successes==2);
+    mock_stage=0;mock_monitor_reject=1;
+    TEST_ASSERT(esp_hosted_start(h,1000U)==STM_ERR_IO && !h->initialized && h->monitor.enabled);
+    mock_stage=0;mock_monitor_reject=0;
+    TEST_ASSERT(esp_hosted_start(h,1000U)==STM_OK);
+    /* Heartbeat receipt and expiration across the HAL tick wrap. */
+    test_hal_set_tick(UINT32_MAX-20000U);h->heartbeat_tick=HAL_GetTick();
+    test_hal_set_signals(GPIO_PIN_RESET);test_hal_set_tick(14000U);
+    TEST_ASSERT(esp_hosted_poll(h)==STM_OK && h->initialized);
+    test_hal_set_tick(16000U);TEST_ASSERT(esp_hosted_poll(h)==STM_OK && !h->initialized);
+    test_hal_set_signals(GPIO_PIN_SET);mock_stage=0;
+    TEST_ASSERT(esp_hosted_start(h,1000U)==STM_OK);
+    /* Ready heartbeat, including protobuf omission of initial zero sequence. */
+    test_hal_set_frame_callback(NULL);
+    uint8_t payload[64],event[32],wire[80];size_t pn=0,wn=0,en=0;
+    en+=test_put_num(event+en,1U,0U);
+    pn+=test_put_num(payload+pn,1U,3U);pn+=test_put_num(payload+pn,2U,770U);
+    pn+=test_put_bytes(payload+pn,770U,event,en);
+    wire[wn++]=1U;wire[wn++]=0U;wire[wn++]=0U;wire[wn++]=2U;wire[wn++]=(uint8_t)pn;wire[wn++]=0U;
+    memcpy(wire+wn,payload,pn);wn+=pn;
+    test_hal_set_tick(h->heartbeat_tick+34900U);
+    TEST_ASSERT(inject_payload(h,3U,wire,wn));TEST_ASSERT(esp_hosted_poll(h)==STM_OK && h->initialized);
+    uint32_t hb=h->heartbeat_tick;test_hal_set_signals(GPIO_PIN_RESET);test_hal_set_tick(hb+34900U);
+    TEST_ASSERT(esp_hosted_poll(h)==STM_OK && h->initialized);
+    test_hal_set_signals(GPIO_PIN_SET);test_hal_set_frame_callback(mock_cp);
+    /* Disable monitor, then an indefinite idle link remains valid. */
+    monitor.enabled=0;TEST_ASSERT(esp_hosted_set_monitor(h,&monitor,100U)==STM_OK);
+    test_hal_set_tick(999999U);TEST_ASSERT(esp_hosted_poll(h)==STM_OK && h->initialized);
+    /* Ready-state INIT invalidates the old session, without an automatic reset. */
+    mock_stage=0;TEST_ASSERT(esp_hosted_poll(h)==STM_OK && !h->initialized && h->diagnostics.state==ESP_HOSTED_STATE_FAULT);
+    uint32_t generation=h->diagnostics.generation;mock_stage=0;
+    TEST_ASSERT(esp_hosted_poll(h)==STM_OK && h->diagnostics.generation==generation);
+    test_hal_set_signals(GPIO_PIN_RESET);TEST_ASSERT(esp_hosted_recover_begin(h,12U)==STM_OK);
+    stm_err_t e=STM_OK;while(h->recovery_phase && e==STM_OK)e=esp_hosted_poll(h);
+    TEST_ASSERT(e==STM_ERR_TIMEOUT && h->diagnostics.recovery_failures==2);
+    mock_stage=0;mock_bad_version=1U;test_hal_set_signals(GPIO_PIN_SET);
+    TEST_ASSERT(esp_hosted_start(h,1000U)==STM_ERR_NOT_SUPPORTED && !h->initialized);
+    mock_bad_version=0U;
+    h->diagnostics.rpc_timeouts=UINT32_MAX;test_hal_set_signals(GPIO_PIN_SET);mock_stage=0;
+    TEST_ASSERT(esp_hosted_start(h,1000U)==STM_OK);TEST_ASSERT(eh_wifi_init(h,100U)==STM_OK);
+    TEST_ASSERT(eh_wifi_set_mode(h,EH_WIFI_MODE_STA,100U)==STM_OK);h->wifi_started=1U;
+    reset_during_request=1U;int8_t old_output=99;
+    TEST_ASSERT(eh_wifi_get_max_tx_power(h,&old_output,100U)==STM_ERR_CANCELLED && old_output==99);
+    TEST_ASSERT(!h->wifi_initialized && !h->initialized && !h->request_active);
+    test_hal_set_frame_callback(NULL);
+    const uint8_t old_connected[]={1,0,0,2,10,0,8,3,16,0x87,6,0xBA,0x30,2,0x12,0};
+    TEST_ASSERT(inject_payload(h,3U,old_connected,sizeof(old_connected)));
+    TEST_ASSERT(esp_hosted_poll(h)==STM_OK && !h->connected);
+    mock_stage=0;test_hal_set_frame_callback(mock_cp);
+    TEST_ASSERT(esp_hosted_start(h,1000U)==STM_OK);TEST_ASSERT(eh_wifi_init(h,100U)==STM_OK);
+    advanced_fault=7;int8_t power=99;h->wifi_started=1;
+    TEST_ASSERT(eh_wifi_get_max_tx_power(h,&power,20U)==STM_ERR_TIMEOUT && h->diagnostics.rpc_timeouts==UINT32_MAX);
+    advanced_fault=0;test_hal_set_frame_callback(NULL);
+    TEST_ASSERT(esp_hosted_reset(h,10,100)==STM_OK && !h->initialized && !h->wifi_started);
+    TEST_ASSERT(esp_hosted_delete(&h)==STM_OK);return 0;
+}
+static stm_err_t queued_results[3];
+static void queued_receive(void *user,const uint8_t *frame,size_t length)
+{
+    for(unsigned i=0;i<3U;++i)queued_results[i]=esp_hosted_send(user,frame,length);
+}
+static int test_receive_queue(void)
+{
+    static uint8_t tx[1600] __attribute__((aligned(32))), rx[1600] __attribute__((aligned(32)));
+    esp_hosted_handle_t h=make_handle(tx,rx,ESP_HOSTED_DUMMY_IF_TYPE);uint8_t ethernet[64]={0};
+    TEST_ASSERT(h!=NULL);h->initialized=h->connected=1U;h->diagnostics.state=ESP_HOSTED_STATE_READY;
+    TEST_ASSERT(esp_hosted_set_callbacks(h,queued_receive,NULL,h)==STM_OK);
+    TEST_ASSERT(inject_payload(h,ESP_HOSTED_STA_IF_TYPE,ethernet,sizeof(ethernet)));
+    TEST_ASSERT(esp_hosted_poll(h)==STM_OK && queued_results[0]==STM_OK && queued_results[1]==STM_OK && queued_results[2]==STM_ERR_NO_MEM);
+    TEST_ASSERT(h->queued_count==2U);
+    TEST_ASSERT(esp_hosted_set_callbacks(h,NULL,NULL,NULL)==STM_OK);
+    TEST_ASSERT(esp_hosted_poll(h)==STM_OK && h->queued_count==1U);
+    esp_hosted_frame_t f;TEST_ASSERT(esp_hosted_decode_frame(h,tx,sizeof(tx),&f)==ESP_HOSTED_FRAME_OK && f.payload_length==sizeof(ethernet));
+    TEST_ASSERT(esp_hosted_reset(h,10,100)==STM_OK && !h->queued_count);
+    TEST_ASSERT(esp_hosted_delete(&h)==STM_OK);return 0;
+}
+
 int main(void)
 {
     TEST_ASSERT(test_dummy_transfer() == 0);
@@ -999,6 +1228,9 @@ int main(void)
     TEST_ASSERT(test_reconnect_policy() == 0);
     TEST_ASSERT(test_runtime_queries() == 0);
     TEST_ASSERT(test_radio_config() == 0);
+    TEST_ASSERT(test_advanced_config() == 0);
+    TEST_ASSERT(test_monitor_recovery() == 0);
+    TEST_ASSERT(test_receive_queue() == 0);
     puts("stm_esp_hosted tests: PASS");
     return 0;
 }

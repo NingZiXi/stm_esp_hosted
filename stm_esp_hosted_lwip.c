@@ -65,6 +65,7 @@ stm_err_t esp_hosted_lwip_sta_stop(esp_hosted_lwip_t *a)
 {
     if (!a || !a->netif || a->netif->state != a) { return STM_ERR_INVALID_ARG; }
     if (a->dhcp_running) { dhcp_stop(a->netif); a->dhcp_running = 0U; }
+    etharp_cleanup_netif(a->netif);
     netif_set_addr(a->netif, NULL, NULL, NULL);
     return STM_OK;
 }
@@ -72,8 +73,7 @@ stm_err_t esp_hosted_lwip_sta_update(esp_hosted_lwip_t *a)
 {
     if (!a || !a->netif || a->netif->state != a) { return STM_ERR_INVALID_ARG; }
     if (!netif_is_link_up(a->netif)) {
-        if (a->dhcp_running) { return esp_hosted_lwip_sta_stop(a); }
-        return STM_OK;
+        return esp_hosted_lwip_sta_stop(a);
     }
     if (!a->dhcp_running) {
         if (dhcp_start(a->netif) != ERR_OK) { return STM_ERR_IO; }

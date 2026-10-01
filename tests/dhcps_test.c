@@ -56,11 +56,22 @@ int main(void)
     now=3600001U; packet(3,b,100,0); assert(sends==6 && last_reply[242]==5);
     ap.link_up=0;
     assert(esp_hosted_lwip_dhcps_update(&dhcp,&ap)==STM_OK && !active);
+    for(unsigned i=0;i<4U;++i)assert(!dhcp.leases[i].last_octet && !dhcp.leases[i].expires_at);
+    assert(ap.ip_addr.byte[3]==1); /* Session loss retains the AP static address. */
     assert(esp_hosted_lwip_dhcps_update(&dhcp,&ap)==STM_OK && !active);
     ap.link_up=1;
     assert(esp_hosted_lwip_dhcps_update(&dhcp,&ap)==STM_OK && active);
     assert(esp_hosted_lwip_dhcps_update(&dhcp,&ap)==STM_OK && active);
     esp_hosted_lwip_dhcps_stop(&dhcp); assert(!active);
+    for(unsigned cycle=0;cycle<50U;++cycle) {
+        ap.link_up=1;
+        assert(esp_hosted_lwip_dhcps_update(&dhcp,&ap)==STM_OK && active);
+        packet(1,a,0,0);packet(3,a,100,0);
+        assert(dhcp.leases[0].last_octet==100);
+        ap.link_up=0;
+        assert(esp_hosted_lwip_dhcps_update(&dhcp,&ap)==STM_OK && !active);
+        assert(!dhcp.pcb && !dhcp.ap_netif && !dhcp.leases[0].last_octet);
+    }
     puts("stm_esp_hosted DHCP tests: PASS");
     return 0;
 }

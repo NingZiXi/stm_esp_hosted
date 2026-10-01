@@ -6,6 +6,9 @@ static SCB_Type test_scb;
 SCB_Type *SCB = &test_scb;
 
 static uint32_t test_tick;
+static GPIO_PinState test_signal = GPIO_PIN_SET;
+void test_hal_set_tick(uint32_t tick) { test_tick = tick; }
+void test_hal_set_signals(GPIO_PinState state) { test_signal = state; }
 static HAL_StatusTypeDef test_spi_status = HAL_OK;
 static uint8_t injected_rx[1600];
 static uint16_t injected_size;
@@ -59,7 +62,7 @@ GPIO_PinState HAL_GPIO_ReadPin(GPIO_TypeDef *port, uint16_t pin)
 {
     (void)port;
     (void)pin;
-    return GPIO_PIN_SET;
+    return test_signal;
 }
 
 void HAL_Delay(uint32_t delay_ms)

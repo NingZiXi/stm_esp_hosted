@@ -44,6 +44,8 @@ err_t etharp_output(struct netif *n, struct pbuf *p, const void *addr)
 { (void)addr; return n->linkoutput(n, p); }
 
 unsigned mock_dhcp_starts, mock_dhcp_stops;
+unsigned mock_arp_cleanups;
+void etharp_cleanup_netif(struct netif *n) { (void)n; ++mock_arp_cleanups; }
 int mock_dhcp_error;
 err_t dhcp_start(struct netif *n)
 {
